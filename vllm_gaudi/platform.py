@@ -448,6 +448,15 @@ class HpuPlatform(Platform):
         # see GAUDISW-249135).
         if os.environ.get('PT_HPU_WEIGHT_SHARING') is None:
             os.environ['PT_HPU_WEIGHT_SHARING'] = '0'
+        # w12 layout for the fused MoE kernels. vLLM always packs w13
+        # concatenated as [gate rows | up rows], so "0" is the only correct
+        # value -- but the getenv default behaves like "1" (interleaved), and a
+        # mismatch is silent: no error, just wrong expert math. Safe to inherit
+        # in any mode; it selects a layout, not an execution strategy. Verified
+        # to take effect even though htorch is already imported here (the guid
+        # extractor reads it at graph-compile time, not at library load).
+        if os.environ.get('PT_HPU_GPT_MOE_WT_INTERLEAVED') is None:
+            os.environ['PT_HPU_GPT_MOE_WT_INTERLEAVED'] = '0'
         is_lazy = htorch.utils.internal.is_lazy()
         if is_lazy:
             torch._dynamo.config.disable = True

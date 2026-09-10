@@ -1326,6 +1326,22 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if cache_weight_lists and hasattr(layer.moe_op, "_cache_weight_lists"):
             layer.moe_op._cache_weight_lists()
 
+        # Graph-safe expert cache: register clamp-path MoE layers for the
+        # lazy maintenance path and snapshot the
+        # run's HPU-graph configuration while the vLLM config context is
+        # active here. Pure-eager runs stay unregistered (no seeding cost).
+        global _HPU_GRAPHS_CONFIGURED
+        if (self.swiglu_limit is not None and getattr(layer, "activation", "silu") == "silu"
+                and not gaudi_envs.VLLM_HPU_MOE_IGNORE_SWIGLU_LIMIT):
+            try:
+                cfg = get_current_vllm_config_or_none()
+                if cfg is not None and _HPU_GRAPHS_CONFIGURED is None:
+                    _HPU_GRAPHS_CONFIGURED = not cfg.model_config.enforce_eager
+            except Exception:
+                pass
+            if _hpu_graphs_configured():
+                _GRAPH_MOE_LAYERS[id(layer)] = layer
+
     def apply_monolithic(
         self,
         layer: FusedMoE,
@@ -1404,6 +1420,11 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 beta=self.swiglu_beta,
                 limit=self.swiglu_limit,
             )
+        elif (activation == "silu" and self.swiglu_limit is not None
+              and not gaudi_envs.VLLM_HPU_MOE_IGNORE_SWIGLU_LIMIT):
+            # silu + swiglu_limit (GLM-5.x): the Habana fused op drops the
+            # clamp; run the clamped-SwiGLU expert path instead.
+            output = _silu_clamp_moe(layer, x, topk_ids, topk_weights, limit=float(self.swiglu_limit))
         else:
             output = layer.moe_op(
                 x,
@@ -1497,6 +1518,10 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 beta=self.swiglu_beta,
                 limit=self.swiglu_limit,
             )
+        elif (activation == "silu" and self.swiglu_limit is not None
+              and not gaudi_envs.VLLM_HPU_MOE_IGNORE_SWIGLU_LIMIT):
+            # silu + swiglu_limit (GLM-5.x): clamped-SwiGLU expert path.
+            output = _silu_clamp_moe(layer, x, topk_ids, topk_weights, limit=float(self.swiglu_limit))
         else:
             output = layer.moe_op(
                 x,

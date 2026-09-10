@@ -1,3 +1,4 @@
+import contextlib
 import os
 import json
 import sys
@@ -46,6 +47,46 @@ def _uses_lmcache_connector() -> bool:
             except (json.JSONDecodeError, TypeError):
                 return False
     return False
+
+
+def _early_tpc_clamp_load():
+    """Import the clamp-SwiGLU TPC kernel loader BEFORE any habana import.
+
+    The kernel-DB glue (GC_KERNEL_PATH + GUID registration) must be loaded
+    before habana initializes; a late load leaves the custom node
+    unresolvable (synStatus 26 at first graph compile). Env-gated and
+    silent-fallback: any failure just leaves the pure-torch clamp path.
+    """
+    import os
+    knob = os.environ.get("VLLM_GLM_TPC_CLAMP", "auto")
+    if knob in ("0", "off"):
+        return
+    # The kernel's torch-ext registration aborts the process outside lazy mode
+    # ("hpu::habana_d2d_memcpy_other is already registered", C++ terminate) —
+    # only attempt the load in lazy mode; eager-mode processes use the
+    # bit-identical pure-torch fallback.
+    if os.environ.get("PT_HPU_LAZY_MODE", "0") != "1":
+        return
+    path = os.environ.get("VLLM_GLM_TPC_CLAMP_LOADER",
+                          os.path.join(os.path.dirname(__file__), "ops", "tpc_clamp_swiglu", "loader.py"))
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vllm_gaudi._tpc_clamp_early_loader", path)
+        if spec is None or spec.loader is None:
+            return  # not a loadable loader.py; silent fallback keeps the pure-torch path
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.load_clamp_swiglu()
+    except Exception:  # noqa: BLE001 — availability probe, silent fallback
+        pass
+
+
+# Load at PACKAGE import (not just plugin register()): the kernel-DB glue
+# must land before the FIRST graph compile in the process — pytest and
+# direct-module imports never call register(), and any earlier test that
+# compiles a graph closes the registration window.
+with contextlib.suppress(Exception):
+    _early_tpc_clamp_load()
 
 
 def register():

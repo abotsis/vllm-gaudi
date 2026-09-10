@@ -1348,6 +1348,87 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         self._cached_w13_scale_views = None
         self._cached_w2_scale_views = None
 
+        # --- clamped SwiGLU (GLM-5.x) via the native GPT-SwiGLU lowering ---
+        # The string-activation overload's enum is terminal {silu,gelu,relu},
+        # but the bias_* overloads take the clamp as (alpha, limit) params.
+        # Set via enable_clamped_swiglu(); None keeps the stock path.
+        self.swiglu_alpha = None
+        self.swiglu_limit = None
+        self._clamp_bias12 = None
+        self._clamp_bias3 = None
+        self._clamp_d_inter = None
+
+    def enable_clamped_swiglu(self, alpha: float, limit: float, absorb_beta: bool = True):
+        """Route forward() through bias_fp8_fused_weights with a clamp.
+
+        The op computes  silu(clamp(g,max=limit)) * (clamp(u,+/-limit) + 1)
+        -- beta is hardcoded to 1. GLM needs beta=0, so bias the UP half by -1
+        (these models carry no expert bias, leaving w12_bias free): the op's
+        (clamp(u-1)+1) then reproduces clamp(u) exactly wherever the clamp does
+        not bind, and saturates one unit high where it does (~0.1-0.2% of
+        elements on real weights).
+        """
+        self.swiglu_alpha = float(alpha)
+        self.swiglu_limit = float(limit)
+        self._absorb_beta = bool(absorb_beta)
+        # Build the aux tensors NOW, not on first forward. Under HPU graphs the
+        # first forward IS the capture, and tensors created there are not valid
+        # graph inputs ("ValidateSyncInputTensors"). Registering them as module
+        # buffers at load time keeps them module-owned and capture-safe.
+        self._build_clamp_aux(torch.bfloat16)
+
+    def _build_clamp_aux(self, dtype):
+        """Bias tensors and the intermediate scale for the clamped path."""
+        w13 = self.w13_list[0].weight.squeeze()
+        w2 = self.w2_list[0].weight.squeeze()
+        two_i, hidden = w13.shape[-2], w13.shape[-1]
+        dev = w13.device
+        b12 = torch.zeros(two_i, device=dev, dtype=dtype)
+        if getattr(self, "_absorb_beta", True):
+            # PT_HPU_GPT_MOE_WT_INTERLEAVED selects the w12 layout. vLLM always
+            # packs w13 CONCATENATED as [gate rows | up rows]
+            # (routed_experts.py _load_w13 narrows w1 -> [0:I), w3 -> [I:2I)),
+            # so only "0" is correct here -- bias the UP half.
+            #
+            # Measured, because the getenv default is NOT the safe one: with the
+            # var UNSET the kernel behaves exactly as with "1" (interleaved).
+            # Probe -- zero the first half of the w13 rows and read ||out||:
+            #   unset -> 3402  (=="1": 3402)   [interleaved: gate rows survive]
+            #   "0"   -> 0.0                   [concatenated: gate == 0 kills it]
+            # Feeding concatenated weights while the kernel reads interleaved is
+            # silent: no error, just wrong math (cos +0.08 vs _silu_clamp_moe,
+            # rising to +0.96 once "0" is set). HPUPlatform.set_torch_compile()
+            # pins it to "0"; process_weights_after_loading refuses to arm if
+            # something else forced it back on.
+            if os.environ.get("PT_HPU_GPT_MOE_WT_INTERLEAVED", "0") == "1":
+                b12[1::2] = -1.0
+            else:
+                b12[two_i // 2:] = -1.0
+        b3 = torch.zeros(w2.shape[-2], device=dev, dtype=dtype)
+        # distinct tensors per expert: the MoE multiplexer registers weights
+        # per expert and aliasing one buffer across all of them leaves inputs
+        # unbound ("Empty tensor optional").
+        b12s, b3s = [], []
+        for i in range(self.num_experts):
+            n12, n3 = f"_clamp_b12_{i}", f"_clamp_b3_{i}"
+            self.register_buffer(n12, b12.clone().contiguous(), persistent=False)
+            self.register_buffer(n3, b3.clone().contiguous(), persistent=False)
+            b12s.append(getattr(self, n12))
+            b3s.append(getattr(self, n3))
+        self._clamp_bias12 = tuple(b12s)
+        self._clamp_bias3 = tuple(b3s)
+        # The clamp bounds the intermediate by silu(limit)*(limit+1), so it fits
+        # fp8 comfortably; scale to use the full e4m3 range for precision.
+        L = self.swiglu_limit
+        bound = float(torch.nn.functional.silu(torch.tensor(L)) * (L + 1.0))
+        dis = []
+        for i in range(self.num_experts):
+            n = f"_clamp_di_{i}"
+            self.register_buffer(n, torch.full((1, ), max(bound / 240.0, 1e-6), device=dev,
+                                               dtype=torch.float32).contiguous(), persistent=False)
+            dis.append(getattr(self, n))
+        self._clamp_d_inter = tuple(dis)
+
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
         self._cached_w13_views = tuple(self.w13_list[i].weight.squeeze() for i in experts_range)
@@ -1390,6 +1471,33 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w2_list = self._cached_w2_views
         w13_weight_scale = self._cached_w13_scale_views
         w2_weight_scale = self._cached_w2_scale_views
+
+        if self.swiglu_limit is not None:
+            # Clamped SwiGLU (GLM-5.x): the native GPT-SwiGLU lowering, which
+            # keeps weights fp8 and fuses routing+GEMMs+activation in one
+            # Synapse kernel -- the path the string-activation overload cannot
+            # express because its enum has no clamped SiLU.
+            x_fp8, x_scale = dynamic_quant(x)
+            return torch.ops.hpu.mixture_of_experts.bias_fp8_fused_weights(
+                x_fp8,
+                topk_ids.to(torch.int64),
+                topk_weights.to(x.dtype),
+                w13_list,
+                w2_list,
+                self._clamp_bias12,
+                self._clamp_bias3,
+                x_scale,
+                self._clamp_d_inter,
+                w13_weight_scale,
+                w2_weight_scale,
+                permuted_weights=permuted_weights,
+                experts_min=self.experts_min,
+                experts_max=self.experts_max,
+                chunk_size=0,
+                total_experts=0,
+                alpha=self.swiglu_alpha,
+                limit=self.swiglu_limit,
+            )
 
         if self.w13_input_scale is None:
             x_fp8, x_scale = dynamic_quant(x)
