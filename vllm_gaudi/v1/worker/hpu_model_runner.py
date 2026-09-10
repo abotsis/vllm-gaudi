@@ -1135,10 +1135,39 @@ def _mark_unbacked_dim0(tensor: torch.Tensor):
     torch._dynamo.decorators.mark_unbacked(tensor, 0)
 
 
+# VLLM_HPU_GRAPH_ASYNC_REPLAY=1: replay captured HPU graphs asynchronously
+# (the bridge queues the recipes from its own thread and returns to Python at
+# once). A decode step is host-bound in the replay loop -- the device sits
+# idle between typical launches -- and in a 2-rank replay-policy bench async
+# replay lowers the per-recipe enqueue cost ~23% while the main thread's
+# per-replay time drops to a small fraction of the synchronous one. Dependent
+# ops enqueued by the main thread right after the replay do see the replayed
+# data (verified bit-identical over a chained-iteration check). IN-MODEL IT
+# IS A REGRESSION: the replay thread's launches are ~10% slower than the
+# main thread's while the main thread sits in sample_tokens contending with
+# it, and single-stream decode fell double-digit percent at identical greedy
+# output. Kept as an opt-in for re-measurement only; do not enable in serve
+# configs.
+_HPU_GRAPH_ASYNC_REPLAY = os.environ.get("VLLM_HPU_GRAPH_ASYNC_REPLAY", "0") == "1"
+
+# VLLM_HPU_DECODE_TENSOR_CACHE=1: keep the HPU-graph tensor cache for DECODE
+# graphs only. The wrapper reads PT_HPUGRAPH_DISABLE_TENSOR_CACHE from the
+# environment on every forward, so the policy can follow the call: with the
+# cache disabled (vllm-gaudi's default, needed for prefill graphs whose
+# intermediates are GB-sized) every replayed recipe re-allocates its outputs
+# -- a material host-side share of each submit for GLM-5.3 decode (~17
+# `empty_hpu_lazy` calls per recipe). Decode graphs' intermediates are KBs.
+# The policy is a deterministic function of is_prompt, so capture (warmup)
+# and replay agree per graph. Default on for glm5_next without speculative
+# decoding (+8% single-stream decode, greedy output identical; see the
+# host-memory note at the assignment); the env var overrides.
+_DECODE_TENSOR_CACHE_ENV = os.environ.get("VLLM_HPU_DECODE_TENSOR_CACHE")
+
+
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
-    return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
-        *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
-            *args, **kwargs)
+    return htorch.hpu.wrap_in_hpu_graph(
+        HpuModelAdapter(*args, **kwargs), disable_tensor_cache=True,
+        asynchronous=_HPU_GRAPH_ASYNC_REPLAY) if htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)
 
 
 def subtuple(obj: object, typename: str, to_copy: list[str], to_override: Optional[dict[str, object]] = None):
@@ -3876,6 +3905,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
+        if getattr(self, "_decode_tensor_cache", False) and use_graphs:
+            os.environ["PT_HPUGRAPH_DISABLE_TENSOR_CACHE"] = "1" if attn_metadata.is_prompt else "0"
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
@@ -5260,9 +5291,42 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.warning("Invalid VLLM_CONFIG_HIDDEN_LAYERS value, using default 1")
             hidden_layer_markstep_interval = 1
         model_config = getattr(self.model, "config", None)
-        modify_model_layers(self.model,
-                            get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
-                            hidden_layer_markstep_interval)
+        # The per-DecoderLayer mark_step hook predates HPU-graph replay: it
+        # flushed the lazy IR per layer so compilation could pipeline against
+        # the device. Under wrap_in_hpu_graph the cuts it makes are captured
+        # and replayed forever, and each replayed recipe boundary costs
+        # ~0.2-0.5 ms of host time per decode step. For glm5_next the hook
+        # fires after the MoE all-reduce and the trailing mHC math, splitting
+        # that math into its own recipe in every layer: 45 of 176 launches per
+        # decode step. Skipping it is bit-identical (greedy parity 8/8) and
+        # measured +10% single-stream decode. VLLM_CONFIG_HIDDEN_LAYERS set
+        # explicitly still wins.
+        skip_layer_markstep = (os.getenv('VLLM_CONFIG_HIDDEN_LAYERS') is None and htorch.utils.internal.is_lazy()
+                               and not self.model_config.enforce_eager
+                               and getattr(model_config, "model_type", None) in ("glm5_next", "glm5_next_text"))
+        # Kept tensors cost host memory: every non-dry-run capture retains
+        # multi-GiB host-side state per worker by the end of decode warmup for
+        # GLM-5.3. With speculative decoding the draft and verify graphs double
+        # the count and a TP=8 warmup OOM-killed a rank on the densest tested
+        # host three times running, so the default is off there.
+        self._decode_tensor_cache = ((_DECODE_TENSOR_CACHE_ENV == "1") if _DECODE_TENSOR_CACHE_ENV is not None else
+                                     (skip_layer_markstep and self.vllm_config.speculative_config is None))
+        # Batched prefill for Mamba-like models is opt-in per model (see
+        # _can_merge_prefill_contents); it only takes effect once the prompt
+        # bucket batch size allows more than one request
+        # (VLLM_PROMPT_BS_BUCKET_MAX > 1).
+        self._batched_mamba_prefill = bool(getattr(self.model, "supports_batched_mamba_prefill", False))
+        if self._batched_mamba_prefill and self.max_prefill_batch_size > 1:
+            logger.info("Batched prefill enabled for a Mamba-like model (up to %d prompts per forward)",
+                        self.max_prefill_batch_size)
+        if skip_layer_markstep:
+            logger.info("[glm5_next] per-DecoderLayer mark_step hook disabled under HPU-graph replay")
+        if self._decode_tensor_cache:
+            logger.info("HPU-graph tensor cache kept for decode graphs (VLLM_HPU_DECODE_TENSOR_CACHE)")
+        else:
+            modify_model_layers(
+                self.model, get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
+                hidden_layer_markstep_interval)
         torch.hpu.synchronize()
         if self.is_pooling_model:
             self.set_causal_option(self.model)

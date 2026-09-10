@@ -9,9 +9,15 @@ from vllm.distributed.device_communicators.base_device_communicator \
     import DeviceCommunicatorBase
 from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group, get_tp_group, get_ep_group
 
+import os
+
 import habana_frameworks.torch as htorch  # noqa: F401
 
 from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata
+
+# See all_reduce(). Default OFF: the mark_step it guards was a stale bridge
+# workaround that cost a graph boundary per collective.
+_ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "0") == "1"
 
 
 class HpuCommunicator(DeviceCommunicatorBase):
@@ -42,10 +48,18 @@ class HpuCommunicator(DeviceCommunicatorBase):
         self.rank = dist.get_rank(group=self.cpu_group)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
-        # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
-        # (which is required for tensor parallel HPUGraph inference)
-        htorch.core.mark_step()
+        # No mark_step here. The one that used to precede this call was a
+        # workaround for an older-bridge bug under PT_HPU_ENABLE_LAZY_COLLECTIVES.
+        # It is a hard graph cut, and a decode step issues ~90 all-reduces (2
+        # per layer), so it cut the step into ~230 recipes with a boundary
+        # after each collective that cost a mid-teens percent of the
+        # single-stream decode step, before counting the recipe merges it
+        # prevented. Re-tested on bridge 1.24 with a 2-rank chained-graph
+        # bench: no mark_step is bit-identical to the workaround and 10%
+        # faster between graphs, 32% faster with the collective fused inside
+        # the graph. VLLM_HPU_ALLREDUCE_MARKSTEP=1 restores the old behaviour.
+        if _ALLREDUCE_MARKSTEP:
+            htorch.core.mark_step()
         dist.all_reduce(input_, group=self.device_group)
         return input_
 

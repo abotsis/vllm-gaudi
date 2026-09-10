@@ -938,6 +938,18 @@ def dequant_block_fp8_weight_naive(weight,
     return dequant_weight
 
 
+
+def restore_leading_dims(output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    """`output.view(*input.shape[:-1], -1)`, except that a 2-D caller gets
+    `output` itself. The view is a no-op reshape there, but the lazy bridge
+    still records it as a view, and a collective fed a view is executed as
+    copy-in / collective / copy-out: two kernel-less recipes plus a stranded
+    launch per site (RowParallelLinear's all-reduce after every fp8 o_proj).
+    """
+    if output.shape[:-1] == input.shape[:-1]:
+        return output
+    return output.view(*input.shape[:-1], -1)
+
 def apply_block_fp8_linear_hpu(
     input: torch.Tensor,
     layer: torch.nn.Module,
@@ -954,15 +966,15 @@ def apply_block_fp8_linear_hpu(
             layer.weight_scale_inv,
             bias,
         )
-        return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+        return restore_leading_dims(output.to(dtype=input.dtype), input)
     return apply_block_fp8_linear_hpu_dequant(
         input,
         layer.weight,
         block_size,
         layer.weight_scale_inv,
         bias=bias,
-        original_M=layer.orig_M,
-        original_N=layer.orig_N,
+        original_M=getattr(layer, 'orig_M_int', layer.orig_M),
+        original_N=getattr(layer, 'orig_N_int', layer.orig_N),
         do_unpad=do_unpad,
     )
 
@@ -981,14 +993,18 @@ def apply_block_fp8_linear_hpu_dequant(
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    original_M = original_M.data.item()
-    original_N = original_N.data.item()
+    # isinstance on a python value is static, so this costs dynamo nothing;
+    # the .item() path remains for callers that still pass tensors.
+    if not isinstance(original_M, int):
+        original_M = original_M.data.item()
+    if not isinstance(original_N, int):
+        original_N = original_N.data.item()
     weight = dequant_block_fp8_weight_naive(weight, weight_scale, block_size, input.dtype, original_M, original_N,
                                             do_unpad)
     output = torch.nn.functional.linear(input_2d, weight, bias=None)
     if bias is not None:
         output = output + bias
-    return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+    return restore_leading_dims(output.to(dtype=input.dtype), input)
 
 
 def apply_fp8_linear_hpu(
@@ -1110,10 +1126,19 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
         layer.get_dequant_weights_func = types.MethodType(get_dequant_weights_func, layer)
 
     layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    orig_M_val, orig_N_val = int(orig_M), int(orig_N)
     orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32, device=weight.device), requires_grad=False)
     orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32, device=weight.device), requires_grad=False)
     layer.register_parameter("orig_M", orig_M)
     layer.register_parameter("orig_N", orig_N)
+    # Plain-int copies. These are load-time constants, but the forward path
+    # recovered them with .item() on every call -- an int -> device tensor ->
+    # int round trip whose only effect is a HARD GRAPH BREAK under
+    # torch.compile (device->host sync; dynamo cannot trace through it), once
+    # per linear per layer. The Parameters stay for other consumers
+    # (attention/oot_mla.py reads layer.orig_M).
+    layer.orig_M_int = int(orig_M_val)
+    layer.orig_N_int = int(orig_N_val)
     htorch.core.mark_step()
     return layer
 

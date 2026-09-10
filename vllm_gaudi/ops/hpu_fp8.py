@@ -135,7 +135,7 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
                                               input_scale=input_scale,
                                               bias=bias,
                                               trans_B=False)
-        return output.view(*x.shape[:-1], -1)
+        return hpu_ops.restore_leading_dims(output, x)
 
     def dequant_fp8_weight(self, layer) -> torch.Tensor:
         if hasattr(layer, "updated_fp8_weight") and layer.updated_fp8_weight:
@@ -144,8 +144,8 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
             layer.weight,
             layer.weight_scale_inv.data,
             self.quant_config.weight_block_size,
-            original_M=layer.orig_M,
-            original_N=layer.orig_N,
+            original_M=getattr(layer, 'orig_M_int', layer.orig_M),
+            original_N=getattr(layer, 'orig_N_int', layer.orig_N),
             do_unpad=True,
         )
         return dequant_weight
