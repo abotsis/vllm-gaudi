@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import dataclasses
 import itertools
 
 import torch
@@ -7,9 +8,53 @@ from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm_gaudi.extension.logger import logger as init_logger
+
+logger = init_logger()
+
+_WARNED_SHORT_BLOCK_TABLE = False
+_PAD_FIX_REPORTED = False
 
 
 class HpuEagleProposer(EagleProposer):
+
+    def load_model(self, target_model) -> None:
+        """GLM-5.3: wrap the target's already-loaded MTP layer instead of
+        loading a second copy.
+
+        The generic path (``SpecDecodeBaseProposer.load_model``) calls
+        ``get_model()`` on a draft config, which for an MTP head packed inside
+        the main checkpoint means a second full pass over 306 GiB of
+        safetensors at every boot, plus a duplicate 0.87 GiB/rank of layer-45
+        weights that the target has already loaded and is holding. GLM-5.3's
+        MTP block also has no ``shared_head.head`` -- the head is shared with
+        the target's ``lm_head`` -- so a standalone draft could not own its
+        head anyway.
+
+        Only the KV cache is new: the MTP block's MLA attention registers
+        itself in the static forward context (the target keeps that
+        registration when speculative decode is on) and is picked up as a
+        draft attention layer here.
+        """
+        if getattr(target_model, "mtp", None) is not None and \
+                type(target_model).__name__.startswith("HpuGlm5Next"):
+            from vllm_gaudi.models.glm5_next_mtp import HpuGlm5NextMTPModel
+            self.model = HpuGlm5NextMTPModel(target_model)
+            static_ctx = self.vllm_config.compilation_config.static_forward_context
+            _pfx = target_model.mtp_prefix + "."
+            # Only entries that actually own a KV cache, mirroring upstream's
+            # filter -- the MoE block registers here too but has no cache.
+            self._draft_attn_layer_names = {
+                n
+                for n, m in static_ctx.items()
+                if n.startswith(_pfx) and getattr(m, "get_kv_cache_spec", None) is not None
+            }
+            logger.warning(
+                "[GLM] MTP draft head bound to the target's layer-45 modules "
+                "(no extra weights loaded); draft attn layers: %s",
+                sorted(self._draft_attn_layer_names) or "NONE -- KV cache will be missing")
+            return
+        super().load_model(target_model)
 
     def propose(
         self,
@@ -164,6 +209,30 @@ class HpuEagleProposer(EagleProposer):
             starting_index += step
         hidden_states_indices = torch.tensor(num_picked_token_indices, device=self.device)
         last_token_indices = torch.tensor(last_token_indices, device=self.device)
+
+        # Unpicked lanes carry -1, and `hidden_states[-1]` is the LAST row, not a
+        # blank: those lanes are fed a real token and a real hidden state. Left
+        # alone, the draft then writes their K/V into its cache at the slot
+        # belonging to their own (real) position, corrupting the very context
+        # its attention reads back. Send those writes to the padding slot
+        # instead, exactly as the runner does for padded decode lanes.
+        pad_mask = hidden_states_indices < 0
+        global _PAD_FIX_REPORTED
+        if not _PAD_FIX_REPORTED:
+            _PAD_FIX_REPORTED = True
+            logger.debug("[GLM] draft pad-lane fix active: padded lanes routed to the pad slot")
+        if bool(pad_mask.any()):
+            sm = getattr(common_attn_metadata, "slot_mapping", None)
+            # The base proposer accepts `runner` but never stores it, so there is
+            # no self.runner to read _PAD_SLOT_ID from here; -1 is the runner's
+            # own (_PAD_SLOT_ID) value and the "garbage slot" the conv path
+            # uses for padded lanes.
+            pad_slot = getattr(getattr(self, "runner", None), "_PAD_SLOT_ID", -1)
+            if sm is not None and sm.numel() >= pad_mask.numel():
+                flat = sm.reshape(-1).clone()
+                flat[:pad_mask.numel()][pad_mask] = pad_slot
+                common_attn_metadata = dataclasses.replace(common_attn_metadata, slot_mapping=flat.view_as(sm))
+
         return common_attn_metadata, hidden_states_indices, last_token_indices
 
     def prepare_attn_metadata(
@@ -190,7 +259,23 @@ class HpuEagleProposer(EagleProposer):
         num_blocks = torch.ceil((positions + 1) / block_size).int()
         num_blocks = num_blocks[:num_seq].tolist()
         block_tables_list = []
+        _avail = block_table_cpu_tensor.shape[1]
         for i, n in enumerate(num_blocks):
+            if n > _avail:
+                # Warmup drives synthetic positions against a minimal dummy
+                # block table, so the table is legitimately shorter than the
+                # position implies -- clamp instead of aborting the boot. In a
+                # real request this would mean the block table is genuinely too
+                # short for the sequence, so keep it loud rather than silent.
+                global _WARNED_SHORT_BLOCK_TABLE
+                if not _WARNED_SHORT_BLOCK_TABLE:
+                    _WARNED_SHORT_BLOCK_TABLE = True
+                    logger.warning(
+                        "[GLM] draft block table is shorter than the position implies "
+                        "(need %d blocks, have %d) -- clamping. Expected during warmup; "
+                        "if this appears while serving, the draft attention is reading a "
+                        "truncated context.", n, _avail)
+                n = _avail
             seq_block_table = block_table_cpu_tensor[i, :n].tolist()
             assert len(seq_block_table) == n
             block_tables_list.append(seq_block_table)
@@ -202,7 +287,9 @@ class HpuEagleProposer(EagleProposer):
         block_numbers = clamped_positions // block_size
 
         # Limit with num_seq because block_table_cpu_tensor is in the shape [num_seq, x]
-        block_numbers = block_numbers.to(torch.int64)[:num_seq]
+        # Same clamp as the block-table loop above: warmup positions are
+        # synthetic and can index past the dummy table's width.
+        block_numbers = block_numbers.to(torch.int64)[:num_seq].clamp_(max=_avail - 1)
         block_ids = torch.ones((batch_size, 1), dtype=torch.int32) * model_runner._PAD_BLOCK_ID
         block_ids[:num_seq] = block_table_cpu_tensor.gather(dim=1, index=block_numbers)
         # Needs to be resolved by defragmenter

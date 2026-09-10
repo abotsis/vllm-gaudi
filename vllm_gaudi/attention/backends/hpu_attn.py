@@ -278,7 +278,12 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         # =========================== #
 
         k_c_normed, k_pe = latent_vec_k.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        if self.qk_rope_head_dim == 0:
+            # NoPE (rope_dim == 0): zero-element reshape is ambiguous — build
+            # the empty rope tensor with explicit leading dim.
+            k_pe = k_c_normed.new_empty(k_c_normed.shape[0], 1, 0)
+        else:
+            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
 
         kv_nope = self.kv_b_proj(k_c_normed)[0]\
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -332,7 +337,9 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
                 HPUPagedAttention.split_kv_cache(k_cache, self.num_kv_heads, self.head_size)
         if isinstance(k_cache, tuple):
             k_cache = k_cache[0]  # Use only key_cache for MLA
-        query = torch.cat([q_nope, q_pe], dim=-1)
+        # NoPE: zero-width cat breaks compiled recipes; contiguous because
+        # downstream batch2block .view()s it.
+        query = (torch.cat([q_nope, q_pe], dim=-1) if q_pe is not None and q_pe.shape[-1] > 0 else q_nope.contiguous())
         key_cache = k_cache.unsqueeze(1) if k_cache is not None else None
         value_cache = None
         output = HPUPagedAttention.forward_decode(query=query,

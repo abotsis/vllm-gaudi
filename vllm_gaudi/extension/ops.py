@@ -18,7 +18,6 @@ import habana_frameworks.torch.utils.experimental as htexp
 import types
 from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -908,19 +907,26 @@ def dequant_block_fp8_weight_naive(weight,
 
     block_size_m, block_size_n = block_size
 
-    # mul scale
+    # mul scale. NB: decode fp8 via the exact LUT (fp8_to_float_safe), NOT
+    # the device .to(dtype) cast: the cast corrupts the top exponent bin
+    # (|v| >= ~256 -> inf/garbage — the HPU e4m3fn cast bug) AND eager vs
+    # compiled lowering of the cast disagree numerically, which flipped greedy
+    # tokens in compiled mode. LUT decode + fp32 scale mul is deterministic
+    # and identical under eager and torch.compile.
+    from vllm_gaudi.ops.hpu_fused_moe import fp8_to_float_safe  # local: avoids import cycle
+    wf = fp8_to_float_safe(weight)  # fp32, exact
     if weight_shape_len == 2:
         weight_scale_m, weight_scale_n = weight_scale.shape
         weight_scale = weight_scale.view(weight_scale_m, 1, weight_scale_n, 1)
-        weight = weight.view(weight_scale_m, block_size_m, weight_scale_n, block_size_n)
-        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        wf = wf.view(weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = (wf * weight_scale.float()).to(dtype)
         dequant_weight = dequant_weight.view(weight_scale_m * block_size_m, weight_scale_n * block_size_n)
         keep_first_dim = False
     elif weight_shape_len == 3:
         fd, weight_scale_m, weight_scale_n = weight_scale.shape
         weight_scale = weight_scale.view(fd, weight_scale_m, 1, weight_scale_n, 1)
-        weight = weight.view(fd, weight_scale_m, block_size_m, weight_scale_n, block_size_n)
-        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        wf = wf.view(fd, weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = (wf * weight_scale.float()).to(dtype)
         dequant_weight = dequant_weight.view(fd, weight_scale_m * block_size_m, weight_scale_n * block_size_n)
         keep_first_dim = True
     else:

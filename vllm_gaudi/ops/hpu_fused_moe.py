@@ -1,7 +1,9 @@
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
+import contextlib
 import os
+from collections import OrderedDict
 from typing import Union
 
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
@@ -30,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
 import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp
 from vllm_gaudi.extension.runtime import get_config
+from vllm_gaudi.ops.hpu_clamp_swiglu import clamp_swiglu
 from vllm_gaudi.utils import has_quant_config
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
@@ -113,6 +116,8 @@ def _unfused_swigluoai_moe(
     w2 = layer.w2_weight  # [E_local, H, I]
     # First global expert id owned by this (EP) rank; matches the experts_min
     # that process_weights_after_loading passes to VllmMixtureOfExpertsOp.
+    if x.numel() == 0:
+        return x.new_empty(x.shape[0], layer.w2_weight.shape[-1] if layer.w2_weight.dim() == 3 else x.shape[-1])
     experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
 
     e_local = w13.shape[0]
@@ -138,7 +143,7 @@ def _unfused_swigluoai_moe(
     # [E_local, T, 2*I] intermediate (which overflows the Synapse compiler and
     # fails with synStatus 26 for large prompt buckets); per-tile shapes stay
     # static and tiles are concatenated back into the original [T, H] output.
-    chunk = 32
+    chunk = 16  # dense/packed bmm chunk (also set in the dense branch)
     token_tile = _SWIGLU_OAI_TOKEN_TILE
     if token_tile <= 0 or token_tile >= tokens:
         token_tile = tokens
@@ -297,6 +302,885 @@ def _swigluoai_moe(
     if (_MOE_DECODE_GATHER and tokens <= _MOE_GATHER_MAX_TOKENS and tokens * k < e_local):
         return _gather_swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=alpha, beta=beta, limit=limit)
     return _unfused_swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=alpha, beta=beta, limit=limit)
+
+
+# --- Safe fp8-e4m3fn decode ---------------------------------------------------
+# The HPU torch cast float8_e4m3fn -> bf16 corrupts the top exponent bin
+# (every |v| >= 256, u8 120-126/248-254, becomes inf/NaN on device; the CPU
+# cast is correct). Real checkpoints quantized at amax/448 populate that bin,
+# so any torch-cast dequant poisons the weights. Decode via a 256-entry LUT
+# (integer gather) instead — exact for every representable e4m3fn value.
+_E4M3FN_LUT: dict = {}
+
+
+def _e4m3fn_lut(device) -> torch.Tensor:
+    key = str(device)
+    if key not in _E4M3FN_LUT:
+        vals = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+        vals = torch.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)  # 0x7F/0xFF -> 0
+        _E4M3FN_LUT[key] = vals.to(device)
+    return _E4M3FN_LUT[key]
+
+
+@torch._dynamo.disable
+def fp8_to_float_safe(w: torch.Tensor) -> torch.Tensor:
+    """Exact fp8-e4m3fn -> fp32 via LUT (HPU cast bug workaround)."""
+    if w.device.type != 'hpu':
+        return w.float()
+    lut = _e4m3fn_lut(w.device)
+    shape = w.shape
+    return lut[w.view(torch.uint8).reshape(-1).long()].reshape(shape)
+
+
+def _dequant_expert_chunk(layer, sel, dtype=None):
+    """Dequantize the selected expert weights (fp8) or pass through.
+
+    Handles both HPU fp8 layouts the engine may leave on the layer:
+      * block: weight [., N, K], scale [., nBlk, kBlk] (same rank)
+      * per-channel (VLLM_HPU_FORCE_CHANNEL_FP8=True default): weight [., N, K]
+        fp8 with scale [., N] (one row scale per output channel)
+    ``sel`` is a slice or an index tensor; ``dtype`` normalizes the result to
+    the activation dtype. Returns (w13, w2) as [c, 2I, H]/[c, H, I].
+    """
+    if isinstance(sel, list):
+        # NB: python-list advanced indexing of an fp8 tensor returns corrupted
+        # data under PT_HPU_LAZY_MODE=1 (verified: list-[5] vs slice(5,6)
+        # differ by ~1.0); index_select is exact. Slices are unaffected.
+        sel_idx = torch.tensor(sel, device=layer.w13_weight.device, dtype=torch.long)
+        w13 = layer.w13_weight.index_select(0, sel_idx)
+        w2 = layer.w2_weight.index_select(0, sel_idx)
+    else:
+        w13 = layer.w13_weight[sel]
+        w2 = layer.w2_weight[sel]
+    if w13.dtype == torch.float8_e4m3fn:
+        dt = torch.bfloat16 if dtype is None else dtype
+        w13_s = (layer.w13_weight_scale_inv.index_select(0, sel_idx).float()
+                 if isinstance(sel, list) else layer.w13_weight_scale_inv[sel].float())
+        w2_s = (layer.w2_weight_scale_inv.index_select(0, sel_idx).float()
+                if isinstance(sel, list) else layer.w2_weight_scale_inv[sel].float())
+        bs = layer.quant_config.weight_block_size
+
+        def _dq(w, ws):
+            wf = fp8_to_float_safe(w)  # [., N, K] fp32, exact (LUT decode)
+            if ws.dim() == w.dim() and ws.shape[-1] != w.shape[-1]:
+                # block scales [., N//bm, K//bk] vs weight [., N, K]
+                n, k = w.shape[-2], w.shape[-1]
+                bm, bk = bs[0], bs[1]
+                wf = wf.reshape(*wf.shape[:-2], n // bm, bm, k // bk, bk)
+                ws = ws.reshape(*ws.shape[:-2], n // bm, 1, k // bk, 1)
+                return (wf * ws).reshape(*w.shape[:-2], n, k).to(dt)
+            if ws.dim() == w.dim():
+                # full elementwise scales
+                return (wf * ws).to(dt)
+            if ws.dim() == w.dim() - 1:
+                # per-channel scales [., N] against [., N, K]
+                return (wf * ws.unsqueeze(-1)).to(dt)
+            raise ValueError(f"unsupported scale layout: w={tuple(w.shape)} s={tuple(ws.shape)}")
+
+        w13 = _dq(w13, w13_s)
+        w2 = _dq(w2, w2_s)
+    elif dtype is not None and w13.dtype != dtype:
+        w13 = w13.to(dtype)
+        w2 = w2.to(dtype)
+    return w13, w2
+
+
+# --- Dequantized-expert cache (GLM clamped-SwiGLU decode fast path) ----------
+# Decode routes to ~8 of 36 local experts per token per layer; without a cache
+# the clamp path re-dequantizes ALL local experts every token (the dominant
+# eager-decode cost, ~0.03 tok/s). Cache the dequantized bf16 weights per
+# (layer, local expert) in an LRU, filled by the dense prefill pass and hit
+# on decode. Memory: each expert holds w13 (2I x H) + w2 (H x I) bf16; the
+# default cap of 10 experts/layer ~= 22 GB/rank for GLM-5.3-Flash shapes
+# (43 MoE layers) — budget against free HBM; disable with 0.
+
+_EXPERT_CACHE_CAP = int(os.environ.get("VLLM_GLM_MOE_CACHE_EXPERTS", "10"))
+_EXPERT_CACHES: dict[int, "OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]"] = {}
+_EXPERT_PACKED: dict[int, tuple] = {}  # (w13, w2, eids) contiguous [cap, H, 2I]/[cap, I, H]
+# Memory-pressure guard: the cache lives OUTSIDE the engine's memory budget
+# (weights + KV sized by gpu_memory_utilization). v10 crashed with a fatal
+# PT_DEVMEM alloc failure when the cache (~21.6 GB/rank at cap 10) exceeded
+# the ~18 GB headroom. Before inserting/evicting/packing we therefore check
+# torch.hpu.mem_get_info and self-shrink the cache so device free never
+# drops below the floor (which must also cover the dense-path fp32 dequant
+# transient, ~3 GB at chunk 16). Alloc failures are caught and degrade to
+# dense-only rather than killing the worker.
+_MIN_FREE_B = int(os.environ.get("VLLM_GLM_MOE_MIN_FREE_GB", "4")) * (1 << 30)
+_CACHE_DEGRADED = False
+
+
+def _device_free_b() -> float:
+    try:
+        return float(torch.hpu.mem_get_info()[0])
+    except Exception:
+        return float("inf")
+
+
+def _relieve_pressure(layer, want_free_b: float, keep=frozenset()) -> None:
+    """Evict LRU non-`keep` experts until free >= want (best effort)."""
+    cache = _EXPERT_CACHES.get(id(layer))
+    while cache is not None and len(cache) > len(keep & cache.keys()) and _device_free_b() < want_free_b:
+        victim = next((e for e in cache if e not in keep), None)
+        if victim is None:
+            return
+        cache.pop(victim)
+
+
+def _relieve_pressure_global(want_free_b: float, protect_key=None, protect_ids=frozenset()) -> None:
+    """Round-robin eviction across ALL layer caches until free >= want
+    (dense-path transients are ~3 GB and may need the whole cache to yield).
+    `protect_ids` on `protect_key`'s layer are never evicted (this call's
+    routed set)."""
+    while _device_free_b() < want_free_b:
+        progressed = False
+        for key, cache in list(_EXPERT_CACHES.items()):
+            if not cache:
+                continue
+            if key == protect_key:
+                victim = next((e for e in cache if e not in protect_ids), None)
+                if victim is None:
+                    continue
+                cache.pop(victim)
+            else:
+                cache.popitem(last=False)
+            progressed = True
+            if _device_free_b() >= want_free_b:
+                return
+        if not progressed:
+            return
+
+
+def _expert_cache(layer):
+    key = id(layer)
+    if key not in _EXPERT_CACHES:
+        _EXPERT_CACHES[key] = OrderedDict()
+    return _EXPERT_CACHES[key]
+
+
+def _packed_experts(layer, dtype, keep=frozenset()):
+    """Contiguous bmm-ready weight buffer for the cached expert set (rebuilt
+    lazily after any cache insertion/eviction; entries are stored already
+    transposed [1, H, 2I]/[1, I, H] and contiguous). `keep` entries survive
+    pressure relief; if one cannot, raises _CacheDegraded (caller -> dense)."""
+    key = id(layer)
+    packed = _EXPERT_PACKED.get(key)
+    cache = _EXPERT_CACHES[key]
+    if packed is None or packed[2] != list(cache.keys()) or packed[0].dtype != dtype:
+        _relieve_pressure(layer, _MIN_FREE_B + (1 << 30), keep=keep)
+        if any(e not in cache for e in keep):
+            raise _CacheDegraded
+        try:
+            w13 = torch.cat([cache[e][0] for e in cache], 0) if cache else layer.w13_weight[:0].new_zeros(0)
+            w2 = torch.cat([cache[e][1] for e in cache], 0) if cache else layer.w2_weight[:0].new_zeros(0)
+        except RuntimeError as _alloc_err:  # alloc failure: drop the packed buffer, degrade
+            _EXPERT_PACKED.pop(key, None)
+            raise _CacheDegraded from _alloc_err
+        packed = (w13, w2, list(cache.keys()))
+        _EXPERT_PACKED[key] = packed
+    return packed
+
+
+class _CacheDegraded(Exception):
+    """Raised internally when cache allocations fail under memory pressure."""
+
+
+# --- Graph-safe expert cache (HPU-graph decode fast path) -------------------
+# The eager LRU cache that preceded this redesign was host-driven: routing is resolved with
+# .cpu().tolist() inside the forward and the packed bmm buffer is rebuilt by
+# torch.cat after insertions. Under HPU-graph capture (wrap_in_hpu_graph)
+# that breaks twice: (a) the host routing / python-set logic executes only at
+# capture time, freezing the capture batch's routing into every replay, and
+# (b) the packed tensors are (re)allocated inside one bucket's capture, so
+# the next bucket replays with stale/empty buffers ("Empty tensor optional
+# ... Strided Params Has Value: 0"). Graph-mode runs therefore had to disable
+# the cache (VLLM_MINIMAX_M3_MOE_DECODE_GATHER=0 -> dense dequant-all, ~3.6x
+# slower).
+#
+# This redesign keeps the numerics identical and splits the work by context:
+#
+# * CAPTURED REGION (what replays execute): _capture_gather_silu_clamp_moe
+#   -- device-only routing (fp32 gate_w scatter -> topk -> sorted gather ids)
+#   plus dequant-in-graph of exactly the gathered G = min(E_local, T*K)
+#   experts. It reads ONLY immutable tensors (fp8 weights, scales, LUT)
+#   besides the live forward inputs, because wrap_in_hpu_graph FREEZES the
+#   values of every non-forward-argument tensor at capture (verified on
+#   device: external index_copy_ writes to python-held tensors, registered
+#   buffers, even in-graph mul_(1) identity writes are all invisible to
+#   replays; only marked user inputs are refreshed). A replay-visible
+#   persistent cache would need the buffers threaded through the forward
+#   signature -- model files are out of scope here. Re-deriving routing on
+#   device each replay is what makes stale-routing impossible, and gathering
+#   only G experts keeps the ~E_local/G dequant-bandwidth win that the dense
+#   workaround gave up.
+#
+# * PYTHON CONTEXTS (engaged steps running eagerly, e.g. shapes that overflow
+#   max_graphs): persistent per-layer state allocated ONCE outside any
+#   capture -- packed_w13 [CAP+1, H, 2I] / packed_w2 [CAP+1, I, H] bf16
+#   (row CAP a permanent zero row) and expert_to_slot [E_local] int64 --
+#   maintained by moe_graph_cache_maintain (host routing, LUT dequant,
+#   index_copy_ into stable slots; LRU eviction) and read by
+#   _static_gather_silu_clamp_moe with static-shape device ops. The engine
+#   work: anything that runs between capture_begin/capture_end
+#   because they would be frozen into the graph and re-executed on every
+#   replay, clobbering later updates.
+#
+# Capacity reuses VLLM_GLM_MOE_CACHE_EXPERTS (allocation is memory-guarded
+# against the same free-HBM floor as the eager cache). The cached static
+# path engages only while tokens*K <= CAP, which makes "a routed expert has
+# no slot" impossible by construction (maintenance caches the whole routed
+# set). Misses that somehow still occur map to the zero row and contribute
+# exactly +0.0, exactly like the existing out-of-local-range gate-weight
+# masking.
+#
+# Engagement (VLLM_GLM_GRAPH_CACHE, default "auto"): "auto" activates the
+# static path whenever HPU-graph intent is latched for this step (the
+# runner's per-step use_graphs decision -- the same latch
+# causal_conv1d_pytorch reads -- or this module's own set_moe_graphs_active),
+# "1" forces it on (eager validation / tests), "0" forces it off. The pure
+# eager default keeps the original host-routed LRU path bit-for-bit.
+_GRAPH_MOE_STATES: dict[int, "_GraphExpertCache"] = {}
+_GRAPH_MOE_LAYERS: dict[int, object] = {}  # id(layer) -> layer (runner hook)
+_HPU_GRAPHS_CONFIGURED: bool | None = None  # snapshotted at weight-load time
+_moe_graphs_active = False  # own latch (tests / serve wrappers)
+
+
+def set_moe_graphs_active(active: bool) -> None:
+    """Latch HPU-graph intent for the graph-safe MoE expert cache.
+
+    Phase-6c latch pattern (cf. causal_conv1d_pytorch.
+    set_conv_pool_hpu_graphs_active, set by the model runner per step). When
+    no one calls this, ``_graphs_engaged`` falls back to reading the runner's
+    conv latch, which is set from the same site.
+    """
+    global _moe_graphs_active
+    _moe_graphs_active = bool(active)
+
+
+def _graphs_engaged() -> bool:
+    """Whether the graph-safe static expert path may run for this step."""
+    mode = os.environ.get("VLLM_GLM_GRAPH_CACHE", "auto").strip().lower()
+    if mode in ("0", "off", "false", "no"):
+        return False
+    if mode in ("1", "on", "true", "yes"):
+        return True
+    if _moe_graphs_active:
+        return True
+    try:  # runner-latched graph intent (the latch causal_conv1d reads)
+        from vllm_gaudi.ops import causal_conv1d_pytorch as _conv
+        return bool(getattr(_conv, "_hpu_graphs_active", False))
+    except Exception:
+        return False
+
+
+def _in_hpu_graph_capture() -> bool:
+    """True between wrap_in_hpu_graph's capture_begin/capture_end.
+
+    Lazy mode (PT_HPU_LAZY_MODE=1, the only mode wrap_in_hpu_graph captures
+    in) exposes NO runtime capture query: is_current_stream_capturing()
+    reads a stream flag the lazy capture path never sets, and the capture
+    stream context is not reflected in current_stream() (both verified on
+    device). We therefore count capture_begin/capture_end ourselves via a
+    small patch installed on habana_frameworks' HPUGraph class (installed
+    once, lazily); the official queries are kept as secondary signals.
+    Fails SAFE: anything unresolved counts as "capturing" (the capturable
+    path is always correct; maintenance inside capture is never).
+    """
+    try:
+        if not torch.hpu.is_available():
+            return False
+        if _HPU_CAPTURE_DEPTH > 0:
+            return True
+        if hasattr(torch.hpu, "is_current_stream_capturing"):
+            return bool(torch.hpu.is_current_stream_capturing())
+        return torch.hpu.current_stream() != torch.hpu.default_stream()
+    except Exception:
+        return False
+
+
+_HPU_CAPTURE_DEPTH = 0
+_CAPTURE_PATCH_LOCK = False
+
+
+def _install_capture_detector() -> None:
+    """Count HPUGraph capture_begin/capture_end calls (idempotent).
+
+    wrap_in_hpu_graph brackets ``orig_fwd`` with HPUGraph().capture_begin()/
+    capture_end() (habana_frameworks torch/hpu/graphs.py); counting those
+    calls is the only reliable in-lazy-mode signal for "python is running
+    inside a graph capture".
+    """
+    global _CAPTURE_PATCH_LOCK
+    if _CAPTURE_PATCH_LOCK:
+        return
+    _CAPTURE_PATCH_LOCK = True
+    try:
+        import habana_frameworks.torch.hpu.graphs as _graphs
+        cls = _graphs.HPUGraph
+        if getattr(cls, "_vllm_gaudi_capture_patched", False):
+            return
+        orig_begin, orig_end = cls.capture_begin, cls.capture_end
+
+        def _counted_begin(self, *a, **k):
+            global _HPU_CAPTURE_DEPTH
+            _HPU_CAPTURE_DEPTH += 1
+            try:
+                return orig_begin(self, *a, **k)
+            except Exception:
+                _HPU_CAPTURE_DEPTH -= 1
+                raise
+
+        def _counted_end(self, *a, **k):
+            global _HPU_CAPTURE_DEPTH
+            _HPU_CAPTURE_DEPTH -= 1
+            return orig_end(self, *a, **k)
+
+        cls.capture_begin = _counted_begin
+        cls.capture_end = _counted_end
+        cls._vllm_gaudi_capture_patched = True
+    except Exception:
+        pass
+
+
+# Install at import time so the FIRST capture (which may happen before any
+# forward-side call of _in_hpu_graph_capture) is already counted. Idempotent;
+# silently skipped when habana_frameworks is unavailable (CPU-only tests).
+_install_capture_detector()
+
+
+def _hpu_graphs_configured() -> bool:
+    """Whether the engine run has HPU graphs enabled at all (sticky).
+
+    Snapshotted once while the vLLM config context is active (weight-load
+    time); gates eager-side cache seeding so pure-eager runs never pay the
+    extra host-routing sync.
+    """
+    global _HPU_GRAPHS_CONFIGURED
+    if _HPU_GRAPHS_CONFIGURED is None:
+        try:
+            cfg = get_current_vllm_config_or_none()
+            _HPU_GRAPHS_CONFIGURED = bool(cfg is not None and not cfg.model_config.enforce_eager)
+        except Exception:
+            _HPU_GRAPHS_CONFIGURED = False
+    return _HPU_GRAPHS_CONFIGURED
+
+
+class _GraphExpertCache:
+    """Per-layer persistent graph-safe dequantized-expert cache."""
+
+    __slots__ = ("packed_w13", "packed_w2", "expert_to_slot", "zero_row", "cap", "dtype", "e_local", "slot_of",
+                 "expert_of_slot", "lru", "free_slots", "layer_ref", "last_topk_ids", "ready")
+
+    def __init__(self, layer, dtype, cap):
+        dev = layer.w13_weight.device
+        e_local, two_i, h = layer.w13_weight.shape
+        i = two_i // 2
+        self.e_local = e_local
+        self.cap = cap
+        self.dtype = dtype
+        self.zero_row = cap  # permanent all-zero row (misses / masking)
+        # Allocated ONCE, OUTSIDE any capture; mutated in-place only
+        # (index_copy_/index_fill_), so their storage addresses -- what a
+        # captured graph binds -- never change.
+        self.packed_w13 = torch.zeros(cap + 1, h, two_i, device=dev, dtype=dtype)
+        self.packed_w2 = torch.zeros(cap + 1, i, h, device=dev, dtype=dtype)
+        self.expert_to_slot = torch.full((e_local, ), -1, device=dev, dtype=torch.long)
+        self.slot_of: dict[int, int] = {}  # host mirror of expert_to_slot
+        self.expert_of_slot: list = [None] * cap
+        self.lru: OrderedDict[int, None] = OrderedDict()  # expert -> None
+        self.free_slots: list[int] = list(range(cap))
+        self.layer_ref = layer
+        self.last_topk_ids = None  # stashed routing tensor (graph-internal)
+        self.ready = False  # True once maintenance has filled it once
+
+
+def _graph_expert_cache(layer, dtype, create=False):
+    """Get (optionally create) the layer's graph-safe cache state.
+
+    Creation is memory-guarded the same way as the eager cache: never let
+    device free drop below the floor, shrinking the capacity (or refusing to
+    create) instead of failing the worker. The layer's eager LRU entries are
+    dropped at creation time -- once the graph path engages they are dead
+    weight and their memory funds the persistent packed buffers.
+    """
+    key = id(layer)
+    state = _GRAPH_MOE_STATES.get(key)
+    if state is not None and state.dtype != dtype:
+        # dtype changed (e.g. test contexts): rebuild outside capture
+        _GRAPH_MOE_STATES.pop(key, None)
+        state = None
+    if state is None and create and _EXPERT_CACHE_CAP > 0:
+        two_i, h = layer.w13_weight.shape[1], layer.w13_weight.shape[2]
+        i = two_i // 2
+        row_b = (h * two_i + i * h) * torch.empty((), dtype=dtype).element_size()
+        cap = _EXPERT_CACHE_CAP
+        free = _device_free_b()
+        if free - (cap + 1) * row_b < _MIN_FREE_B:
+            # try to fund the buffers from the (now unused) eager caches
+            _EXPERT_CACHES.pop(key, None)
+            _EXPERT_PACKED.pop(key, None)
+            _relieve_pressure_global(_MIN_FREE_B + (cap + 1) * row_b)
+            free = _device_free_b()
+            cap = min(cap, max(int((free - _MIN_FREE_B) // row_b) - 1, 0))
+        else:
+            _EXPERT_CACHES.pop(key, None)
+            _EXPERT_PACKED.pop(key, None)
+        if cap > 0:
+            try:
+                state = _GraphExpertCache(layer, dtype, cap)
+                _GRAPH_MOE_STATES[key] = state
+            except RuntimeError:  # alloc failure under pressure: no cache
+                state = None
+    return state
+
+
+def moe_graph_cache_maintain(layer, topk_ids, dtype):
+    """Graph-EXTERNAL cache maintenance. NEVER call while capturing.
+
+    Resolves this batch's routed local experts from a host copy of
+    ``topk_ids`` (obtained outside the graph), dequantizes misses with the
+    exact LUT path (one batched call, like the eager path), and writes them
+    into the persistent packed rows at stable slots with index_copy_
+    (in-place, storage-stable) plus the matching expert_to_slot updates
+    (index_copy_/index_fill_). Eviction reuses the least-recently-used slot
+    when the cache is full; slot->expert bookkeeping is host-side python,
+    device state is only ever mutated here, outside capture. After a
+    successful call every routed expert of this batch has a slot, so the
+    cached static path (used in python contexts) can never miss on this
+    routing. (HPU-graph REPLAYS do not read this cache -- wrap_in_hpu_graph
+    freezes non-input tensor values at capture -- they recompute routing
+    and dequant on device via _capture_gather_silu_clamp_moe.)
+    """
+    state = _graph_expert_cache(layer, dtype, create=True)
+    if state is None or _in_hpu_graph_capture():
+        # defensive: never mutate/allocate cache state between
+        # capture_begin/capture_end (ops would be frozen into the graph)
+        return state if state is not None else None
+    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
+    e_local = state.e_local
+    state.last_topk_ids = topk_ids
+    ids_h = topk_ids.detach().cpu().tolist()
+    routed = set()
+    for row in ids_h:
+        for eid in row:
+            lid = int(eid) - experts_min
+            if 0 <= lid < e_local:
+                routed.add(lid)
+    if not routed:
+        return state
+    for e in routed:  # LRU-touch this batch's hits so eviction can only
+        if e in state.lru:  # drop cold experts
+            state.lru.move_to_end(e)
+    misses = sorted(e for e in routed if e not in state.slot_of)
+    if not misses:
+        state.ready = True
+        return state
+    slot_pick: list[int] = []
+    evicted: list[int] = []
+    for _ in misses:
+        if state.free_slots:
+            slot_pick.append(state.free_slots.pop())
+            continue
+        victim = next((e for e in state.lru if e not in routed), None)
+        if victim is None:  # cap < routed set: caller must not take the
+            break  # static path for this batch (checked via state.cap)
+        state.lru.pop(victim)
+        slot = state.slot_of.pop(victim)
+        state.expert_of_slot[slot] = None
+        evicted.append(victim)
+        slot_pick.append(slot)
+    misses = misses[:len(slot_pick)]
+    if misses:
+        _relieve_pressure(layer, _MIN_FREE_B)  # room for the fp32 transient
+        try:
+            mw13, mw2 = _dequant_expert_chunk(layer, misses, dtype=dtype)
+        except RuntimeError:
+            _relieve_pressure_global(_MIN_FREE_B, protect_key=id(layer), protect_ids=frozenset(routed))
+            mw13, mw2 = _dequant_expert_chunk(layer, misses, dtype=dtype)
+        dev = state.expert_to_slot.device
+        slots_t = torch.tensor(slot_pick, device=dev, dtype=torch.long)
+        state.packed_w13.index_copy_(0, slots_t, mw13.transpose(1, 2))
+        state.packed_w2.index_copy_(0, slots_t, mw2.transpose(1, 2))
+        miss_t = torch.tensor(misses, device=dev, dtype=torch.long)
+        state.expert_to_slot.index_copy_(0, miss_t, slots_t)
+        if evicted:
+            state.expert_to_slot.index_fill_(0, torch.tensor(evicted, device=dev, dtype=torch.long), -1)
+        for e, s in zip(misses, slot_pick):
+            state.slot_of[e] = s
+            state.expert_of_slot[s] = e
+            state.lru[e] = None
+    # ready ONLY when this batch's whole routed set is cached -- that is the
+    # invariant the static path needs (zero-row misses would silently drop
+    # expert contributions otherwise).
+    if all(e in state.slot_of for e in routed):
+        state.ready = True
+    return state
+
+
+def _seed_graph_cache(layer, topk_ids, dtype) -> None:
+    """Warm the graph cache during EAGER dense steps (prefill routing).
+
+    Only runs when the engine has HPU graphs configured (pure-eager runs are
+    untouched), never inside a capture (allocating persistent buffers there
+    is the original crash pattern), and stops once the cache is full --
+    steady-state maintenance belongs to the runner hook. Seeding during
+    prefill means the first decode capture already sees a hot-set cache
+    instead of a cold one.
+    """
+    if not _hpu_graphs_configured() or _in_hpu_graph_capture():
+        return
+    state = _graph_expert_cache(layer, dtype, create=True)
+    if state is None or len(state.lru) >= state.cap:
+        return
+    with contextlib.suppress(Exception):
+        moe_graph_cache_maintain(layer, topk_ids, dtype)
+
+
+def _dequant_expert_chunk_t(layer, sel_idx, dtype=None):
+    """Tensor-indexed, fully device-side variant of _dequant_expert_chunk.
+
+    Produces bit-identical rows ([c, H, 2I]/[c, I, H], contiguous) but takes a
+    DEVICE index tensor, so it is capturable in HPU graphs: every op is
+    static-shape and the only non-input tensors it reads (fp8 weights,
+    scales, LUT) are immutable constants, which graphs may safely freeze.
+    """
+    w13 = layer.w13_weight.index_select(0, sel_idx)  # [c, 2I, H]
+    w2 = layer.w2_weight.index_select(0, sel_idx)  # [c, H, I]
+    if w13.dtype == torch.float8_e4m3fn:
+        dt = torch.bfloat16 if dtype is None else dtype
+        w13_s = layer.w13_weight_scale_inv.index_select(0, sel_idx).float()
+        w2_s = layer.w2_weight_scale_inv.index_select(0, sel_idx).float()
+        bs = layer.quant_config.weight_block_size
+
+        def _dq(w, ws):
+            wf = fp8_to_float_safe(w)  # [., N, K] fp32, exact (LUT decode)
+            if ws.dim() == w.dim() and ws.shape[-1] != w.shape[-1]:
+                n, k = w.shape[-2], w.shape[-1]
+                bm, bk = bs[0], bs[1]
+                wf = wf.reshape(*wf.shape[:-2], n // bm, bm, k // bk, bk)
+                ws = ws.reshape(*ws.shape[:-2], n // bm, 1, k // bk, 1)
+                return (wf * ws).reshape(*w.shape[:-2], n, k).to(dt)
+            if ws.dim() == w.dim():
+                return (wf * ws).to(dt)
+            if ws.dim() == w.dim() - 1:
+                return (wf * ws.unsqueeze(-1)).to(dt)
+            raise ValueError(f"unsupported scale layout: w={tuple(w.shape)} s={tuple(ws.shape)}")
+
+        w13 = _dq(w13, w13_s)
+        w2 = _dq(w2, w2_s)
+    elif dtype is not None and w13.dtype != dtype:
+        w13 = w13.to(dtype)
+        w2 = w2.to(dtype)
+    return w13.transpose(1, 2).contiguous(), w2.transpose(1, 2).contiguous()
+
+
+def _capture_gather_silu_clamp_moe(layer, x, topk_ids, topk_weights, *, limit):
+    """Capturable routed-expert compute: gather + dequant-in-graph.
+
+    Why not the persistent packed cache here: wrap_in_hpu_graph freezes the
+    VALUES of every non-forward-argument tensor at capture (verified on
+    device: external index_copy_ writes to python-held tensors, registered
+    buffers, and even in-graph mul_(1) identity writes are all invisible to
+    replays; only marked user inputs are copied per replay). A cache read
+    inside the graph would therefore forever serve the capture-time rows.
+    The fp8 weights/scales/LUT, by contrast, are immutable -- freezing them
+    is exactly correct -- so this path gathers the routed G experts with
+    device ops and dequantizes them in-graph every replay. That keeps the
+    ~E_local/G dequant-bandwidth win over the dense fallback (the 3.6x
+    regression) while being correct for ARBITRARY replayed routing.
+
+    Numerically identical to the eager gather path: same gate weights (fp32
+    scatter), same ascending expert order, same dequant math, same chunk-32
+    bf16 accumulation.
+    """
+    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
+    e_local = layer.w13_weight.shape[0]
+    hidden = x.shape[-1]
+    tokens = x.shape[0]
+    k = topk_ids.shape[-1]
+
+    local_ids = topk_ids - experts_min  # [T, K]
+    in_range = (local_ids >= 0) & (local_ids < e_local)
+    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+    gate_w = x.new_zeros(tokens, e_local, dtype=torch.float32)
+    gate_w.scatter_add_(
+        1,
+        safe_ids,
+        torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).to(torch.float32),
+    )
+
+    g = min(e_local, tokens * k)
+    hit = (gate_w > 0).to(torch.float32).sum(0)  # [E_local]
+    gather_ids = torch.sort(torch.topk(hit, g, sorted=False).indices).values  # [G]
+    gw_g = gate_w.index_select(1, gather_ids).t().unsqueeze(-1)  # [G, T, 1]
+
+    acc = torch.zeros_like(x)
+    chunk = 32  # same chunking as the eager gather branch
+    for cs in range(0, g, chunk):
+        ce = min(cs + chunk, g)
+        c = ce - cs
+        w13c, w2c = _dequant_expert_chunk_t(layer, gather_ids[cs:ce], dtype=x.dtype)
+        xe = x.unsqueeze(0).expand(c, tokens, hidden)
+        h = torch.bmm(xe, w13c)
+        act = clamp_swiglu(h, limit)
+        y = torch.bmm(act, w2c)
+        wc = gw_g[cs:ce]
+        acc = acc + (y.float() * wc).sum(0).to(x.dtype)
+    return acc
+
+
+def _static_gather_silu_clamp_moe(layer, x, topk_ids, topk_weights, state, *, limit):
+    """Graph-safe routed-expert compute (capturable; numerically identical
+    to the eager gather path).
+
+    Everything here is static-shape device ops: NO host reads (.cpu()/
+    .item()/.tolist()), NO python-set routing logic, NO allocations of
+    persistent state. The expert->slot mapping is resolved at REPLAY time
+    from the live expert_to_slot table, and weight rows come from the
+    persistent packed buffers via index_select -- so cache updates performed
+    outside the graph between replays are picked up without re-capture.
+    Uncached / out-of-range experts land on the permanent zero row and
+    contribute exactly +0.0, matching the eager path's gate-weight masking.
+    Accumulation mirrors the eager gather branch exactly (ascending expert
+    order, chunk-32 bf16 partials, fp32 weighted per-chunk sums).
+    """
+    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
+    e_local = state.e_local
+    hidden = x.shape[-1]
+    tokens = x.shape[0]
+    k = topk_ids.shape[-1]
+    state.last_topk_ids = topk_ids  # pure python ref; hooks read it later
+
+    # Per-(token, local-expert) combine weight, identical to the eager paths.
+    local_ids = topk_ids - experts_min  # [T, K]
+    in_range = (local_ids >= 0) & (local_ids < e_local)
+    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+    gate_w = x.new_zeros(tokens, e_local, dtype=torch.float32)
+    gate_w.scatter_add_(
+        1,
+        safe_ids,
+        torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).to(torch.float32),
+    )
+
+    # Static gathered-expert count G = min(E_local, T*K) >= distinct hit
+    # experts: every routed expert is always included, padding rows carry
+    # gate weight 0 and contribute exact +0.0 (same argument as the eager
+    # gather path). All values recomputed at replay from live routing.
+    g = min(e_local, tokens * k)
+    hit = (gate_w > 0).to(torch.float32).sum(0)  # [E_local]
+    gather_ids = torch.sort(torch.topk(hit, g, sorted=False).indices).values  # [G]
+
+    # Expert -> slot via the DEVICE table (dynamic at replay); misses and
+    # out-of-range ids land on the permanent zero row.
+    slots = state.expert_to_slot.index_select(0, gather_ids)  # [G]
+    safe_slots = torch.where(slots >= 0, slots, torch.full_like(slots, state.zero_row))
+    w13 = state.packed_w13.index_select(0, safe_slots)  # [G, H, 2I]
+    w2 = state.packed_w2.index_select(0, safe_slots)  # [G, I, H]
+    gw_g = gate_w.index_select(1, gather_ids).t().unsqueeze(-1)  # [G, T, 1]
+
+    acc = torch.zeros_like(x)
+    chunk = 32  # same chunking as the eager gather branch
+    for cs in range(0, g, chunk):
+        ce = min(cs + chunk, g)
+        c = ce - cs
+        xe = x.unsqueeze(0).expand(c, tokens, hidden)
+        h = torch.bmm(xe, w13[cs:ce])
+        act = clamp_swiglu(h, limit)
+        y = torch.bmm(act, w2[cs:ce])
+        wc = gw_g[cs:ce]
+        acc = acc + (y.float() * wc).sum(0).to(x.dtype)
+    return acc
+
+
+def _silu_clamp_expert_act(h: torch.Tensor, d: int, limit: float) -> torch.Tensor:
+    """GLM clamped SwiGLU (transformers Glm5Next semantics): clamp gate BEFORE
+    silu, clamp up symmetrically; computed in fp32."""
+    g = h[..., :d].float().clamp(max=limit)
+    u = h[..., d:].float().clamp(min=-limit, max=limit)
+    return (torch.nn.functional.silu(g) * u).to(h.dtype)
+
+
+@torch._dynamo.disable
+def _silu_clamp_moe(layer, x, topk_ids, topk_weights, *, limit: float) -> torch.Tensor:
+    """Dense expert MLP with GLM clamped-SwiGLU for silu+swiglu_limit models.
+
+    ``@torch._dynamo.disable``: this path mixes dynamic-ish index ops with
+    chunked bmm; under compiled decode regions it trips Synapse
+    Sections-validation failures. Running it eager is correct and the outer
+    compiled region simply splits around it.
+
+    The Habana fused MoE op only supports plain silu/gelu and silently drops
+    ``swiglu_limit``; without the clamp the expert outputs are unbounded and
+    generation degenerates (observed as verbatim repetition). This path mirrors
+    ``_unfused_swigluoai_moe`` (dense, expert-chunked bmm, token-tiled) but
+    dequantizes block-fp8 expert chunks on the fly — persistent bf16 copies
+    would not fit (43 MoE layers x 1.8 GB/rank). Below the gather token
+    threshold only the routed experts are dequantized (decode bandwidth).
+    """
+    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
+    e_local = layer.w13_weight.shape[0]
+    hidden = x.shape[-1]
+    tokens = x.shape[0]
+    k = topk_ids.shape[-1]
+
+    local_ids = topk_ids - experts_min
+    in_range = (local_ids >= 0) & (local_ids < e_local)
+    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+    gate_w = x.new_zeros(tokens, e_local, dtype=torch.float32)
+    gate_w.scatter_add_(
+        1,
+        safe_ids,
+        torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).to(torch.float32),
+    )
+
+    chunk = 32
+    # Decode-gather regime: only the routed experts, served from the LRU
+    # dequant cache packed into one contiguous buffer. Eager context only
+    # (dynamo.disable): routing is resolved host-side to keep the HPU op
+    # count ~8/token. NB: torch.nonzero on device is dynamic-shape and trips
+    # Synapse sections validation — host-side set() is used instead.
+    if _MOE_DECODE_GATHER and tokens <= _MOE_GATHER_MAX_TOKENS and tokens * k < e_local:
+        if _graphs_engaged():
+            # HPU-graph intent latched for this step: use a graph-safe routed path.
+            # Between capture_begin/capture_end only the capturable gather+dequant
+            # path may run (zero host reads; the persistent cache is NOT read
+            # there because wrap_in_hpu_graph freezes non-input tensor values at
+            # capture -- replays would forever serve capture-time rows). In eager
+            # python contexts with graphs latched, maintenance runs first (host
+            # routing + LUT dequant + index_copy_ into stable slots, all outside
+            # capture) and the cached static path -- bit-identical to both the
+            # captured path and the eager gather path -- serves the step.
+            state = _GRAPH_MOE_STATES.get(id(layer))
+            if state is not None and state.dtype == x.dtype:
+                state.last_topk_ids = topk_ids  # python ref; hook maintains from it
+            if _in_hpu_graph_capture():
+                return _capture_gather_silu_clamp_moe(layer, x, topk_ids, topk_weights, limit=limit)
+            try:
+                state = moe_graph_cache_maintain(layer, topk_ids, x.dtype)
+            except Exception:
+                state = None
+            # tokens*k <= cap guarantees maintenance can cache the whole routed
+            # set, making the cached static path exactly the eager gather path.
+            if (state is not None and state.dtype == x.dtype and state.ready and state.cap >= tokens * k):
+                return _static_gather_silu_clamp_moe(layer, x, topk_ids, topk_weights, state, limit=limit)
+            # cache unusable (cold / capacity / pressure): fall through to the
+            # original eager branch below -- this is a python context, so its
+            # host routing is safe and bit-for-bit the default behavior.
+        try:
+            # lazy-mode boundary: the host-routing below (D2H + python set ops)
+            # must not be fused into the surrounding lazy graph; mark_step
+            # flushes cleanly (no-op in eager mode).
+            import habana_frameworks.torch.core as _htcore
+            _htcore.mark_step()
+            ids_h = topk_ids.detach().cpu().tolist()
+            wts_h = topk_weights.detach().float().cpu().tolist()
+            gw_rows: list[list[float]] = []  # per-token weights over gather_list
+            for row_ids, row_w in zip(ids_h, wts_h):
+                row: dict[int, float] = {}
+                for eid, wv in zip(row_ids, row_w):
+                    lid = eid - experts_min
+                    if 0 <= lid < e_local:
+                        row[lid] = row.get(lid, 0.0) + float(wv)
+                gw_rows.append(row)
+            routed = set()
+            for row in gw_rows:
+                routed.update(row.keys())
+            if not routed:
+                return x.new_zeros(tokens, hidden)
+            gather_list = sorted(routed)
+            cache = _expert_cache(layer)
+            for e in gather_list:  # LRU-touch this token's hits so eviction
+                if e in cache:  # can only remove cold experts
+                    cache.move_to_end(e)
+            misses = [e for e in gather_list if e not in cache or cache[e][0].dtype != x.dtype]
+            if misses:  # one batched dequant for all misses (per-miss op cost /8)
+                _relieve_pressure(layer, _MIN_FREE_B)  # room for the fp32 transient
+                try:
+                    mw13, mw2 = _dequant_expert_chunk(layer, misses, dtype=x.dtype)
+                except RuntimeError:
+                    _relieve_pressure_global(_MIN_FREE_B, protect_key=id(layer), protect_ids=frozenset(gather_list))
+                    mw13, mw2 = _dequant_expert_chunk(layer, misses, dtype=x.dtype)
+                for i, e in enumerate(misses):
+                    cache[e] = (mw13[i:i + 1].transpose(1, 2).contiguous(), mw2[i:i + 1].transpose(1, 2).contiguous())
+                while (_EXPERT_CACHE_CAP if not _CACHE_DEGRADED else 0) > 0 and \
+                        len(cache) > (_EXPERT_CACHE_CAP if not _CACHE_DEGRADED else 0):
+                    cache.popitem(last=False)
+            if any(e not in cache for e in gather_list):
+                # cap smaller than the routed set: cannot serve from cache this
+                # call — fall through to the dense path for correctness.
+                pass
+            else:
+                pw13, pw2, cached_eids = _packed_experts(layer, dtype=x.dtype, keep=frozenset(gather_list))
+                slot = torch.tensor([cached_eids.index(e) for e in gather_list], device=x.device, dtype=torch.long)
+                w13 = pw13.index_select(0, slot)  # [g, H, 2I]
+                w2 = pw2.index_select(0, slot)  # [g, I, H]
+                g_count = len(gather_list)
+                gw_g = torch.tensor([[row.get(e, 0.0) for e in gather_list] for row in gw_rows],
+                                    device=x.device,
+                                    dtype=torch.float32).t().unsqueeze(-1)  # [g, T, 1]
+                acc = torch.zeros_like(x)
+                for cs in range(0, g_count, chunk):
+                    ce = min(cs + chunk, g_count)
+                    c = ce - cs
+                    xe = x.unsqueeze(0).expand(c, tokens, hidden)
+                    h = torch.bmm(xe, w13[cs:ce])
+                    act = clamp_swiglu(h, limit)
+                    y = torch.bmm(act, w2[cs:ce])
+                    wc = gw_g[cs:ce]
+                    acc = acc + (y.float() * wc).sum(0).to(x.dtype)
+                return acc
+        except (_CacheDegraded, ValueError, KeyError):
+            # cache/packing inconsistency under pressure: dense path below
+            pass
+            # (fall through: _CacheDegraded or cap < routed set -> dense below)
+
+    # Dense prefill path: expert-chunked bmm, token-tiled, dequant per chunk.
+    # chunk 16 halves the fp32 dequant transient (~3 GB) vs 32, so the dense
+    # fallback stays servable under cache pressure.
+    chunk = 16
+    _seed_graph_cache(layer, topk_ids, x.dtype)  # warm graph cache (prefill
+    # routing) when HPU graphs are configured; no-op in pure-eager runs
+    _relieve_pressure_global(_MIN_FREE_B + (3 << 30), protect_key=id(layer))
+    token_tile = _SWIGLU_OAI_TOKEN_TILE
+    if token_tile <= 0 or token_tile >= tokens:
+        token_tile = tokens
+    # Expert chunks OUTER, token tiles INNER. The dequantized chunk does not
+    # depend on the tile, so the original (tile-outer) nesting re-dequantized
+    # every expert once per tile: at 8192 tokens / tile 512 that is 16 dequants
+    # of the same 16 experts, ~13 GB of bf16 rows plus their fp32 transients,
+    # all accumulated into ONE lazy recipe (nothing flushes until the MoE
+    # all-reduce). Hoisting it makes that 1 dequant, and the per-tile
+    # Each tile still sums expert chunks in increasing `start` order, so the
+    # accumulation order -- and the result -- is bit-identical to before.
+    #
+    # Two things that look like obvious follow-ups here are NOT safe, both
+    # measured against the repro at 8192 tokens:
+    #   * an htcore.mark_step() inside the nest, to bound the recipe further --
+    #     _silu_clamp_moe runs inside the wrap_in_hpu_graph-wrapped model
+    #     forward, and flushing there dies with "ValidateSyncInputTensors
+    #     tensor_data is empty", even on the bypass_hpu_graphs branch;
+    #   * `del w13c, w2c` after the tile loop, to release the chunk early --
+    #     same failure. The recipe is still deferred at that point, so dropping
+    #     the last python reference takes the storage with it.
+    # Hoisting the dequant is what shrinks the recipe; neither of those is
+    # needed on top of it.
+    tiles = [(ts, min(ts + token_tile, tokens)) for ts in range(0, tokens, token_tile)]
+    accs = [torch.zeros_like(x[ts:te]) for ts, te in tiles]
+    for start in range(0, e_local, chunk):
+        end = min(start + chunk, e_local)
+        c = end - start
+        w13c, w2c = _dequant_expert_chunk(layer, slice(start, end), dtype=x.dtype)
+        w13c = w13c.transpose(1, 2)  # [c, H, 2I]
+        w2c = w2c.transpose(1, 2)  # [c, I, H]
+        for i, (tstart, tend) in enumerate(tiles):
+            xt = x[tstart:tend]
+            t = xt.shape[0]
+            xe = xt.unsqueeze(0).expand(c, t, hidden)
+            h = torch.bmm(xe, w13c)
+            act = clamp_swiglu(h, limit)
+            y = torch.bmm(act, w2c)
+            gate_wc = gate_w[tstart:tend, start:end].t().unsqueeze(-1)
+            accs[i] = accs[i] + (y.float() * gate_wc).sum(0).to(x.dtype)
+    return accs[0] if len(accs) == 1 else torch.cat(accs, dim=0)
 
 
 def model_has_quant_config() -> bool:

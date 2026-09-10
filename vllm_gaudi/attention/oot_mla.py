@@ -144,7 +144,13 @@ class HPUMLAAttention(MLAAttention):
 
         if not is_prefill:
             # decode
-            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            if self.qk_rope_head_dim == 0:
+                # NoPE: splitting off a zero-width q_pe poisons compiled
+                # Synapse recipes (reshape [.., 1, 4] -> [.., 256] failure);
+                # the whole q is the nope part and q_pe stays None.
+                q_nope, q_pe = q, None
+            else:
+                q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             # Convert from (B, N, P) to (N, B, P)
             q_nope = q_nope.transpose(0, 1)
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
@@ -154,8 +160,13 @@ class HPUMLAAttention(MLAAttention):
 
         slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
 
-        latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
-        latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
+        if self.qk_rope_head_dim == 0:
+            # NoPE: no rope component; skip the concat entirely (zero-width
+            # tensors break compiled Synapse recipes) and use the raw latent.
+            latent_vec_k = k_c_normed.reshape(-1, self.kv_lora_rank)
+        else:
+            latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
+            latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
 
         # write the latent and rope to kv cache
         if kv_cache is not None and len(kv_cache) >= 2:
