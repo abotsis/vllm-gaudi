@@ -4050,11 +4050,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logprobs = self.sampler.compute_logprobs(logits)
             gathered = self._gather_prompt_logprobs_hpu(logprobs, num_prompt_logprobs, tgt_token_ids)
 
-            # Transfer HPU->CPU async.
+            # Transfer HPU->CPU. Blocking on purpose: the destination is a plain
+            # CPU tensor the engine reads right after execute_model returns, and
+            # nothing between here and there synchronizes the device. An async
+            # copy that has not landed yet is read as stale zeros/garbage.
             chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(gathered.logprob_token_ids, non_blocking=True)
-            logprobs_tensors.logprobs[chunk_slice].copy_(gathered.logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(gathered.selected_token_ranks, non_blocking=True)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(gathered.logprob_token_ids, non_blocking=False)
+            logprobs_tensors.logprobs[chunk_slice].copy_(gathered.logprobs, non_blocking=False)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(gathered.selected_token_ranks, non_blocking=False)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
@@ -4459,7 +4462,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         htorch.core.mark_step()
         self._diag_sampler_after(capture, sampler_output)
-        return sampler_output, sampling_metadata
+        return self._own_sampled_logprobs(sampler_output), sampling_metadata
+
+    def _own_sampled_logprobs(self, sampler_output):
+        """Hand retention code host-owned logprob tensors.
+
+        sample_tokens keeps ``sampler_output.logprobs_tensors`` from every
+        sampler call of a step (each prefill segment, then decode) and only
+        converts them in _build_logprobs_output after the last call. Those are
+        lazy HPU tensors; keeping them alive across further sampler calls (and,
+        under async scheduling, into the next step) is a lifetime hazard, and
+        the serving-side symptoms matched one: top_logprobs rows whose token
+        ids and values disagree (duplicated values, a chosen token listed below
+        a higher one, -inf -> -9999 for the chosen token). Copy once, blocking,
+        while the producing step is still current: [rows, k+1] ints and floats,
+        and only when logprobs were requested. The spec path already does the
+        same before parse_output.
+        """
+        lp = getattr(sampler_output, "logprobs_tensors", None)
+        if lp is None or lp.logprob_token_ids.device.type == "cpu":
+            return sampler_output
+        cu_tensor = lp.cu_num_generated_tokens_tensor
+        sampler_output.logprobs_tensors = LogprobsTensors(
+            lp.logprob_token_ids.to(device="cpu", non_blocking=False, copy=True),
+            lp.logprobs.to(device="cpu", non_blocking=False, copy=True),
+            lp.selected_token_ranks.to(device="cpu", non_blocking=False, copy=True),
+            lp.cu_num_generated_tokens,
+            None if cu_tensor is None else cu_tensor.to(device="cpu", non_blocking=False, copy=True),
+        )
+        return sampler_output
 
     def _pool(
         self,

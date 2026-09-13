@@ -43,7 +43,7 @@ def load_runner(events, rank, saved):
     methods = [
         node for cls in tree.body if isinstance(cls, ast.ClassDef) for node in cls.body
         if isinstance(node, ast.FunctionDef) and (
-            node.name.startswith("_diag_sampler_") or node.name == "_run_sampling")
+            node.name.startswith("_diag_sampler_") or node.name in ("_run_sampling", "_own_sampled_logprobs"))
     ]
     for method in methods:
         method.returns = None
