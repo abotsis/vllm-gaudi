@@ -63,7 +63,7 @@ echo "$(date +%s) BUSY 0 $CLAIM_ID claimed" >> /tmp/gaudirpc_cards.state
 
 export LD_LIBRARY_PATH="/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/lib:/opt/habanalabs/openmpi-5.0.8/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$REPO"
-export PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE=1 PT_HPU_MEMORY_POOL=none
+export PT_HPU_LAZY_MODE=1 PT_HPU_LAZY_ACC_PAR_MODE="${PT_HPU_LAZY_ACC_PAR_MODE:-1}" PT_HPU_MEMORY_POOL=none  # ACC_PAR overridable for A/B
 export PT_HPU_GPT_MOE_WT_INTERLEAVED=0 VLLM_USE_V1=1 VLLM_COMPACT_GDN=0
 export VLLM_GLM_FUSED_CLAMP_MOE=1 VLLM_BUCKETING_STRATEGY=lin
 export VLLM_DECODE_BLOCK_BUCKET_MIN="$BLK_MIN" VLLM_DECODE_BLOCK_BUCKET_MAX=3200 VLLM_DECODE_BLOCK_BUCKET_STEP=512
@@ -75,7 +75,7 @@ if [ "$ROLE" = "capture" ] || [ "$ROLE" = "logits" ]; then
   export VLLM_DIAG_SAMPLER_DIR="$DIAG_DIR"  # dir must NOT exist at boot: a stale sentinel disables capture for the runner
   rm -rf "$DIAG_DIR"
 fi
-echo "buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none}"
+echo "buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none} acc_par=$PT_HPU_LAZY_ACC_PAR_MODE tensor_cache=${VLLM_HPU_DECODE_TENSOR_CACHE:-default} allreduce_markstep=${VLLM_HPU_ALLREDUCE_MARKSTEP:-0} hidden_layers=${VLLM_CONFIG_HIDDEN_LAYERS:-unset}"
 
 PLUGIN_DIR="$($PY -c 'import vllm_gaudi, os; print(os.path.dirname(os.path.dirname(vllm_gaudi.__file__)))')"
 case "$PLUGIN_DIR" in */vllm-gaudi-fresh) : ;; *) echo "FATAL: vllm_gaudi resolves to '$PLUGIN_DIR'"; exit 1 ;; esac
