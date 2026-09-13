@@ -3,6 +3,7 @@
 #
 #   ROLE=capture ./tools/diag_window.sh   # layer-0 KDA-interior capture (serial vs co-batched fork)
 #   ROLE=parity  ./tools/diag_window.sh   # bucket-parity A/B: pin decode (bs, blocks) buckets, greedy serial-vs-concurrent
+#   ROLE=logits  ./tools/diag_window.sh   # raw per-row logits under graph replay for 8 identical prompts (sampler capture only)
 #
 # Shared-box protocol (same as glm53-bench/boot_gate.sh): waits for all 8
 # compute nodes free via wait_cards.sh, records a claim in
@@ -47,7 +48,7 @@ echo "=== diag_window ROLE=$ROLE branch=$(git -C "$REPO" branch --show-current) 
 # (2, ctx) forward while a lone prompt runs (1, ctx). For parity, pin the
 # prompt bs bucket too (MIN=PBSD) so a lone prompt pads into the same recipe
 # as a co-batched pair. PBSD=2 ROLE=parity is the prefill-side A/B.
-if [ "$ROLE" = "parity" ]; then
+if [ "$ROLE" = "parity" ] || [ "$ROLE" = "logits" ]; then
   BS_MIN="${BS_MIN:-8}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-32}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-$PBSD}"
 else
   BS_MIN="${BS_MIN:-1}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-1}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-1}"
@@ -70,7 +71,7 @@ export VLLM_DECODE_BS_BUCKET_MIN="$BS_MIN" VLLM_DECODE_BS_BUCKET_STEP="$BS_STEP"
 export VLLM_PROMPT_CTX_BUCKET_MAX=3200 VLLM_PROMPT_CTX_BUCKET_STEP=512
 export VLLM_PROMPT_QUERY_BUCKET_STEP=2048 VLLM_PROMPT_BS_BUCKET_MAX="$PBSD" VLLM_PROMPT_BS_BUCKET_MIN="$PROMPT_BS_MIN"
 export VLLM_DEBUG=fwd                      # [fwd] (phase, bs, query, blocks) trace per forward on every worker
-if [ "$ROLE" = "capture" ]; then
+if [ "$ROLE" = "capture" ] || [ "$ROLE" = "logits" ]; then
   export VLLM_DIAG_SAMPLER_DIR="$DIAG_DIR"  # dir must NOT exist at boot: a stale sentinel disables capture for the runner
   rm -rf "$DIAG_DIR"
 fi
@@ -150,6 +151,16 @@ case "$ROLE" in
     echo "--- layer-0 KDA interior, first fork pair ---"
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PY" "$REPO/tools/diag_compare.py" compare --auto --dir "$DIAG_DIR" \
       | grep -E "^====|layers\.0\.|final_norm|unavailable|^    - " | head -80
+    ;;
+  logits)
+    echo "--- arming raw-logits sampler capture only (ENABLED, no LAYER_ENABLED: graphs still replayed) ---"
+    mkdir -p "$DIAG_DIR" && chmod 700 "$DIAG_DIR"
+    (umask 077; : > "$DIAG_DIR/ENABLED")
+    "$PY" "$REPO/tools/diag_window_driver.py" logits --prompt "${LOGITS_PROMPT:-prose}" \
+      --base "http://127.0.0.1:$PORT/v1" --out "$RUNDIR/diag_logits_${STAMP}.json"
+    sleep 3
+    echo "--- per-row logit agreement under replay ---"
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PY" "$REPO/tools/diag_logits_rows.py" "$DIAG_DIR" | tee "$RUNDIR/diag_logits_rows_${STAMP}.txt"
     ;;
   parity)
     echo "--- greedy serial-vs-concurrent probe under pinned buckets ---"

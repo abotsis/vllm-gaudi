@@ -177,9 +177,31 @@ def run_rowdep(args):
     return out
 
 
+def run_logits(args):
+    """Feed the sampler raw-logits capture (ENABLED sentinel only, graphs replayed):
+    one serial run of --prompt, then 8 identical concurrent copies. Small
+    --max-tokens: the capture budget is 64 MiB of bf16 logits per rank."""
+    prompt = {**PROMPTS, **DELTA_PROMPTS}[args.prompt]
+    out = {"mode": "logits", "prompt": args.prompt, "max_tokens": args.max_tokens}
+    out["serial"] = ask(args.base, args.model, prompt, args.max_tokens)["text"]
+    time.sleep(args.gap)
+    barrier = threading.Barrier(8)
+
+    def same(_, barrier=barrier):
+        barrier.wait()
+        return ask(args.base, args.model, prompt, args.max_tokens)["text"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        out["rows"] = list(pool.map(same, range(8)))
+    out["distinct"] = len(set(out["rows"]))
+    out["match_serial"] = sum(t == out["serial"] for t in out["rows"])
+    print(f"logits probe: distinct={out['distinct']} match_serial={out['match_serial']}/8", flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["capture", "parity", "rowdep"])
+    ap.add_argument("mode", choices=["capture", "parity", "rowdep", "logits"])
     ap.add_argument("--base", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default="glm-5.3-flash")
     ap.add_argument("--prompt", default="prose", choices=list(PROMPTS))
@@ -190,8 +212,8 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.max_tokens is None:
-        args.max_tokens = {"capture": 3, "parity": 256, "rowdep": 128}[args.mode]
-    out = {"capture": run_capture, "parity": run_parity, "rowdep": run_rowdep}[args.mode](args)
+        args.max_tokens = {"capture": 3, "parity": 256, "rowdep": 128, "logits": 20}[args.mode]
+    out = {"capture": run_capture, "parity": run_parity, "rowdep": run_rowdep, "logits": run_logits}[args.mode](args)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=1)
     print(f"wrote {args.out}")
