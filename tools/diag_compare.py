@@ -55,6 +55,9 @@ ORDER = [
     "kda.o_proj",
     "attention_raw_output",
     "attention_mhc_post",
+    "mlp.router_logits",
+    "mlp.router_bias",
+    "mlp.routing_topk",
     "ffn_mhc_post",
 ]
 
@@ -128,6 +131,46 @@ def deltas(x, y):
     )
 
 
+def route(logits, bias, top_k):
+    """noaux_tc with n_group=1 (GLM-5.3-Flash): top-k of sigmoid(logits)+bias.
+
+    Returns (selected ids, margin), margin = score[k-1] - score[k]: how far the
+    weakest selected expert is from the first unselected one. A tiny margin on
+    one side and a different id set on the other is a routing flip caused by a
+    perturbation of that size.
+    """
+    scores = torch.sigmoid(logits.float()) + bias.float()
+    vals, ids = torch.topk(scores, top_k + 1)
+    return ids[:top_k].tolist(), float(vals[top_k - 1] - vals[top_k])
+
+
+def routing_rows(pa, ia, pb, ib, top_k=8):
+    """Per MoE layer: do the fork rows pick the same experts, and how close was the call?"""
+    amap = {e["name"]: e for e in pa["boundaries"]}
+    bmap = {e["name"]: e for e in pb["boundaries"]}
+    rows = []
+    for name in sorted(amap):
+        if not name.endswith(".mlp.router_logits") or name not in bmap:
+            continue
+        bias_name = name[:-len("router_logits")] + "router_bias"
+        if bias_name not in amap:
+            continue
+        bias = amap[bias_name]["rows"][0]
+        xa = amap[name]["rows"]
+        xb = bmap[name]["rows"]
+        ids_a, margin_a = route(xa[ia if xa.shape[0] > 1 else 0], bias, top_k)
+        ids_b, margin_b = route(xb[ib if xb.shape[0] > 1 else 0], bias, top_k)
+        rows.append(
+            dict(boundary=name[:-len("router_logits")] + "routing_topk",
+                 status="ROUTING",
+                 changed=top_k - len(set(ids_a) & set(ids_b)),
+                 margin_a=margin_a,
+                 margin_b=margin_b,
+                 ids_a=ids_a,
+                 ids_b=ids_b))
+    return rows
+
+
 def compare_record(pa, ia, pb, ib):
     amap = {e["name"]: e for e in pa["boundaries"]}
     bmap = {e["name"]: e for e in pb["boundaries"]}
@@ -140,6 +183,7 @@ def compare_record(pa, ia, pb, ib):
         ra = ia if xa.shape[0] > 1 else 0
         rb = ib if xb.shape[0] > 1 else 0
         rows.append(dict(boundary=name, status="MATCHED", **deltas(xa[ra], xb[rb])))
+    rows.extend(routing_rows(pa, ia, pb, ib))
     return rows
 
 
@@ -147,6 +191,8 @@ def delta_class(r):
     """Classify on relL2: max_rel is dominated by near-zero reference elements and is not diagnostic."""
     if r.get("status") == "MISSING":
         return "MISSIN"
+    if r.get("status") == "ROUTING":
+        return "ROUTE "
     if "note" in r:
         return "SHAPEx"
     m = r.get("rel_l2", 0.0)
@@ -242,6 +288,11 @@ def run(d, pairs, mode, out, auto=False):
         for row in sorted(rows, key=sort_key):
             if delta_class(row) in ("MISSIN", "SHAPEx"):
                 print(f"  [{delta_class(row)}] {row['boundary']}")
+                continue
+            if delta_class(row) == "ROUTE ":
+                flag = "FLIP" if row["changed"] else "same"
+                print(f"  [ROUTE ] {row['boundary']:<52s} experts {flag} changed={row['changed']} "
+                      f"margin={row['margin_a']:.2e}/{row['margin_b']:.2e}")
                 continue
             tag = delta_class(row)
             extra = ""

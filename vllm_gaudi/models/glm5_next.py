@@ -841,6 +841,7 @@ class HpuGlm5NextMoE(nn.Module):
 
     def __init__(self, config, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self._prefix = prefix
         quant_config = vllm_config.quant_config
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.n_routed_experts,
@@ -887,6 +888,13 @@ class HpuGlm5NextMoE(nn.Module):
         shape = hidden_states.shape
         x = hidden_states.view(-1, shape[-1])
         router_logits = self.gate(x.to(torch.float32))[0]
+        # Routing evidence for the batch-shape diagnostic: fp32 gate output per
+        # token plus the (constant) selection bias, so top-k and its margin can
+        # be recomputed offline (n_group=1 => plain top-k of sigmoid(x)+bias).
+        _diag_layer_boundary(self._prefix + ".router_logits", router_logits)
+        _diag_layer_boundary(self._prefix + ".router_bias",
+                             self.gate_e_score_correction_bias.view(1, -1),
+                             row_indices=[0])
         out = self.experts(hidden_states=x, router_logits=router_logits)
         return out.view(shape)
 

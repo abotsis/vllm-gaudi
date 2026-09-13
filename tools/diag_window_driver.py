@@ -30,6 +30,25 @@ spec.loader.exec_module(greedy)
 
 PROMPTS = dict(greedy.PROMPTS)
 
+# The batched-prefill first-token reproducer from the 2026-09-11 campaign: JSON
+# echo prompts of different lengths. "delta" flipped its first token between a
+# lone (1, ctx) prefill and a co-batched (2, ctx) one on bf16-mHC boots.
+_NOTE = "Reference notes: {}. "
+DELTA_PROMPTS = {
+    "j_alpha":
+    _NOTE.format("plants need water and sunlight") * 45 +
+    '\nReturn ONLY this JSON object, unchanged: {"id":"alpha","value":391}',
+    "j_beta":
+    _NOTE.format("healthy soil helps roots") * 80 +
+    '\nReturn ONLY this JSON object, unchanged: {"id":"beta","value":529}',
+    "j_gamma":
+    _NOTE.format("observe leaves regularly") * 60 +
+    '\nReturn ONLY this JSON object, unchanged: {"id":"gamma","value":841}',
+    "j_delta":
+    _NOTE.format("seeds need suitable conditions") * 35 +
+    '\nReturn ONLY this JSON object, unchanged: {"id":"delta","value":961}',
+}
+
 
 def ask(base, model, prompt, max_tokens):
     return greedy.post(base, model, prompt, max_tokens)
@@ -68,17 +87,20 @@ def run_capture(args):
 
 
 def run_parity(args):
-    names = list(PROMPTS)
+    prompts = dict(PROMPTS)
+    if not args.no_delta:
+        prompts.update(DELTA_PROMPTS)
+    names = list(prompts)
     out = {"mode": "parity", "max_tokens": args.max_tokens, "results": {}}
     for name in names:
-        out["results"][name] = {"serial": ask(args.base, args.model, PROMPTS[name], args.max_tokens)}
+        out["results"][name] = {"serial": ask(args.base, args.model, prompts[name], args.max_tokens)}
         print(f"  serial {name:9s} {out['results'][name]['serial']['completion_tokens']} tok", flush=True)
     time.sleep(args.gap)
     barrier = threading.Barrier(len(names))
 
     def fire(name):
         barrier.wait()
-        return name, ask(args.base, args.model, PROMPTS[name], args.max_tokens)
+        return name, ask(args.base, args.model, prompts[name], args.max_tokens)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as pool:
         for name, r in pool.map(fire, names):
@@ -110,6 +132,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--stagger", type=float, default=50.0, help="ms between B and C (capture)")
     ap.add_argument("--gap", type=float, default=2.0, help="s to let the engine drain between phases")
+    ap.add_argument("--no-delta", action="store_true", help="parity: omit the JSON first-token reproducer prompts")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.max_tokens is None:

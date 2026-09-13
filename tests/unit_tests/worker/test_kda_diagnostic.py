@@ -142,3 +142,25 @@ def test_model_forward_instruments_every_kda_stage():
     assert calls["_diag_kda_pool"] == ["conv_pool_in", "conv_pool_out"]
     # both prefill and decode branches record conv_out
     assert calls["_diag_kda"].count("conv_out") == 2
+
+
+def test_moe_forward_records_router_logits_and_bias():
+    tree = ast.parse(MODEL.read_text())
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "HpuGlm5NextMoE")
+    fwd = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+    calls = [
+        n for n in ast.walk(fwd)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_diag_layer_boundary"
+    ]
+    names = {}
+    for call in calls:
+        # name is self._prefix + ".<suffix>"
+        assert isinstance(call.args[0], ast.BinOp)
+        names[call.args[0].right.value] = call
+    assert set(names) == {".router_logits", ".router_bias"}
+    bias = names[".router_bias"]
+    rows = next(kw for kw in bias.keywords if kw.arg == "row_indices")
+    assert [c.value for c in rows.value.elts] == [0]
+    assert not names[".router_logits"].keywords
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    assert any(isinstance(n, ast.Assign) and ast.unparse(n) == "self._prefix = prefix" for n in ast.walk(init))

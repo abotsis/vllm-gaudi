@@ -43,10 +43,14 @@ echo "=== diag_window ROLE=$ROLE branch=$(git -C "$REPO" branch --show-current) 
 # bs MIN=STEP=8 -> {8}; blocks MIN=32 -> {32,64,128,256,512,...} (8 seqs x ~3
 # blocks = 24 < 32). Pinning bs alone (the findings doc's first proposal) is NOT
 # enough because the block dimension changes the recipe too.
+# Prompt side: with PBSD>1 the scheduler may co-batch two prefills into a
+# (2, ctx) forward while a lone prompt runs (1, ctx). For parity, pin the
+# prompt bs bucket too (MIN=PBSD) so a lone prompt pads into the same recipe
+# as a co-batched pair. PBSD=2 ROLE=parity is the prefill-side A/B.
 if [ "$ROLE" = "parity" ]; then
-  BS_MIN="${BS_MIN:-8}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-32}"
+  BS_MIN="${BS_MIN:-8}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-32}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-$PBSD}"
 else
-  BS_MIN="${BS_MIN:-1}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-1}"
+  BS_MIN="${BS_MIN:-1}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-1}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-1}"
 fi
 
 DIAG_DIR="${DIAG_DIR:-/tmp/glm53-mla-win-$STAMP}"   # direct child of /tmp (gate requirement)
@@ -64,13 +68,13 @@ export VLLM_GLM_FUSED_CLAMP_MOE=1 VLLM_BUCKETING_STRATEGY=lin
 export VLLM_DECODE_BLOCK_BUCKET_MIN="$BLK_MIN" VLLM_DECODE_BLOCK_BUCKET_MAX=3200 VLLM_DECODE_BLOCK_BUCKET_STEP=512
 export VLLM_DECODE_BS_BUCKET_MIN="$BS_MIN" VLLM_DECODE_BS_BUCKET_STEP="$BS_STEP" VLLM_DECODE_BS_BUCKET_MAX="$MAXSEQ"
 export VLLM_PROMPT_CTX_BUCKET_MAX=3200 VLLM_PROMPT_CTX_BUCKET_STEP=512
-export VLLM_PROMPT_QUERY_BUCKET_STEP=2048 VLLM_PROMPT_BS_BUCKET_MAX="$PBSD"
+export VLLM_PROMPT_QUERY_BUCKET_STEP=2048 VLLM_PROMPT_BS_BUCKET_MAX="$PBSD" VLLM_PROMPT_BS_BUCKET_MIN="$PROMPT_BS_MIN"
 export VLLM_DEBUG=fwd                      # [fwd] (phase, bs, query, blocks) trace per forward on every worker
 if [ "$ROLE" = "capture" ]; then
   export VLLM_DIAG_SAMPLER_DIR="$DIAG_DIR"  # dir must NOT exist at boot: a stale sentinel disables capture for the runner
   rm -rf "$DIAG_DIR"
 fi
-echo "buckets: bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) PBSD=$PBSD diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none}"
+echo "buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none}"
 
 PLUGIN_DIR="$($PY -c 'import vllm_gaudi, os; print(os.path.dirname(os.path.dirname(vllm_gaudi.__file__)))')"
 case "$PLUGIN_DIR" in */vllm-gaudi-fresh) : ;; *) echo "FATAL: vllm_gaudi resolves to '$PLUGIN_DIR'"; exit 1 ;; esac
@@ -139,8 +143,8 @@ case "$ROLE" in
     "$PY" "$REPO/tools/diag_window_driver.py" parity --base "http://127.0.0.1:$PORT/v1" \
       --out "$RUNDIR/diag_parity_${STAMP}.json"
     echo "parity rc=$?  (0 = all prompts identical serial vs concurrent)"
-    echo "--- decode bucket shapes seen on rank 0 ---"
-    tr '\r' '\n' < "$LOG" | grep -E "Worker_TP0.*\[fwd\] \('decode'" | sed 's/.*\[fwd\] //' | sort | uniq -c
+    echo "--- forward shapes seen on rank 0 (prompt and decode) ---"
+    tr '\r' '\n' < "$LOG" | grep -E "Worker_TP0.*\[fwd\]" | sed 's/.*\[fwd\] //' | sort | uniq -c
     ;;
   *) echo "unknown ROLE=$ROLE"; exit 2 ;;
 esac
