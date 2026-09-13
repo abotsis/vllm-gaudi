@@ -78,6 +78,7 @@ class InputBatch:
         logitsprocs: Optional[LogitsProcessors] = None,
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
+        max_num_blocks_per_req: list[int] | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -129,7 +130,8 @@ class InputBatch:
         # requires the caller to pass the per-group block count. HPU does not
         # use DCP (cp_world_size == 1), so max_num_blocks reduces to
         # cdiv(max_model_len, block_size) per KV cache group.
-        max_num_blocks = [cdiv(max_model_len, block_size) for block_size in block_sizes]
+        max_num_blocks = (max_num_blocks_per_req if max_num_blocks_per_req is not None else
+                          [cdiv(max_model_len, block_size) for block_size in block_sizes])
         self.block_table = MultiGroupBlockTable(max_num_reqs=max_num_reqs,
                                                 max_num_batched_tokens=max_num_batched_tokens,
                                                 pin_memory=pin_memory,

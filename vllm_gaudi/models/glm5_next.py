@@ -78,6 +78,7 @@ from vllm_gaudi.ops.causal_conv1d_pytorch import (
 )
 from vllm_gaudi.ops.hpu_kda_eager import (chunk_kda_eager, chunk_kda_spec_states, kda_decode_step)
 from vllm_gaudi.ops.hpu_kda_pytorch import hpu_chunk_kda
+from vllm_gaudi.ops.hpu_kda_conv import hpu_kda_conv_update
 
 import os
 
@@ -254,6 +255,8 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
     def __init__(self, config, vllm_config: VllmConfig, prefix: str = "") -> None:
         GatedDeltaNetAttention.__init__(self, config, vllm_config=vllm_config, prefix=prefix)
         _spec = getattr(vllm_config, "speculative_config", None)
+        if _spec is not None and vllm_config.cache_config.enable_prefix_caching:
+            raise NotImplementedError("GLM KDA speculative state publication requires prefix caching to be disabled.")
         # Query length of a speculative verify step (num_spec + 1); 1 when off.
         self._spec_verify_len = (_spec.num_speculative_tokens + 1) if _spec is not None else 1
         self._spec_masks_by_len = {}
@@ -572,7 +575,7 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
                 B_, S_ = 1, T
 
             core_b, final_state = _glm_kda_chunk(q, k, v, gg, bb, init, self.mamba_chunk_size)
-            core = core_b.view(T, H, D)
+            core = core_b.reshape(T, H, D)
             _kda_save_state(final_state, ssm_state, store_indices, guard_padding=prefill_num_seqs > 1)
 
         elif conv_state is not None:
@@ -586,41 +589,29 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
             # Tokens per sequence this step: 1 for ordinary decode, num_spec+1
             # while verifying a draft chain.
             spec_len = (num_tokens // num_decodes) if num_decodes > 0 else 1
-            # Pool wider than the kernel needs => speculative layout.
-            _wide_conv = (conv_state is not None and conv_w is not None and conv_state.shape[1] > conv_w.shape[-1] - 1)
-            # The conv cache keeps ONE wide row per sequence and rewinds inside
-            # it by num_accepted-1 (see _hpu_causal_conv1d_spec_update), so it
-            # takes a 1-D slot id -- candidate slots are the recurrent state's
-            # business, not the conv's. Upstream GDN passes
-            # spec_state_indices[:, 0] here for the same reason.
-            qkv = hpu_causal_conv1d_update(
-                x=mixed_qkv,
-                conv_state=conv_state,
-                weight=conv_w,
-                bias=None,
-                activation="silu",
-                conv_state_indices=(_kda_conv_slots(state_indices, num_decodes) if state_indices is not None else None),
-                query_start_loc=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
-                # Only hand the conv its speculative path when this step is
-                # actually verifying a chain. num_accepted_tokens is present on
-                # EVERY step once speculation is configured, and passing it with
-                # spec_len == 1 routes an ordinary 1-token decode into the spec
-                # update, which then host-syncs in its varlen fallback and dies
-                # under HPU-graph capture.
-                # One convention for the whole rolling window. Under speculation
-                # the pool is width-1+num_spec wide, but the ORDINARY decode
-                # update (hpu_causal_conv1d_fn_update) only maintains the last
-                # width-1 columns of it, while the spec update rewinds across
-                # the full width. Alternating between them leaves the older
-                # columns stale, and the next rewind reads that staleness --
-                # generation stays fluent and drifts. So once the pool is wide,
-                # always take the spec update, with max_query_len=1 on ordinary
-                # steps (num_reqs*1 == tokens, so it stays on the fixed-shape
-                # path, not the host-syncing varlen fallback).
-                num_accepted_tokens=(num_accepted_tokens[:num_decodes] if
-                                     (num_accepted_tokens is not None and _wide_conv) else None),
-                max_query_len=(spec_len if (_wide_conv and num_accepted_tokens is not None) else -1),
-            )
+            if state_indices is not None and state_indices.dim() == 2:
+                qkv = hpu_kda_conv_update(
+                    x=mixed_qkv,
+                    pool=conv_state,
+                    weight=conv_w,
+                    load_indices=state_indices[:num_decodes],
+                    store_indices=store_indices[:num_decodes],
+                    accepted=num_accepted_tokens[:num_decodes],
+                    query_start_loc=query_start_loc[:num_decodes + 1],
+                    max_query_len=spec_len,
+                    activation="silu",
+                )
+            else:
+                conv_slots = _kda_conv_slots(state_indices, num_decodes) if state_indices is not None else None
+                qkv = hpu_causal_conv1d_update(
+                    x=mixed_qkv,
+                    conv_state=conv_state,
+                    weight=conv_w,
+                    bias=None,
+                    activation="silu",
+                    conv_state_indices=conv_slots,
+                    query_start_loc=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
+                )
             T = num_tokens
             q = qkv[:, :self.qkv_dim_local].view(T, H, D)
             k = qkv[:, self.qkv_dim_local:2 * self.qkv_dim_local].view(T, H, D)

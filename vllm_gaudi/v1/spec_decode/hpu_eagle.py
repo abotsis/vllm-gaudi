@@ -56,6 +56,22 @@ class HpuEagleProposer(EagleProposer):
             return
         super().load_model(target_model)
 
+    def prefill_cache_only(self, target_token_ids, target_positions, target_hidden_states, common_attn_metadata):
+        """Populate MTP prompt KV without sampling or advancing another draft step."""
+        if self.method != "mtp":
+            raise ValueError("Prompt cache fill is supported only for MTP")
+        if target_hidden_states.ndim == 2:
+            target_hidden_states = target_hidden_states.unsqueeze(0)
+        if target_hidden_states.shape[:-1] != target_token_ids.shape:
+            raise ValueError("MTP prompt hidden states must match the token bucket")
+        self.model(
+            input_ids=target_token_ids,
+            positions=target_positions,
+            hidden_states=target_hidden_states,
+            inputs_embeds=None,
+            attn_metadata=common_attn_metadata,
+        )
+
     def propose(
         self,
         # [virtual_batch_size, seq_len]
@@ -109,10 +125,7 @@ class HpuEagleProposer(EagleProposer):
         target_positions = target_positions.view(-1)
         # [batch_size]
         positions = target_positions[last_token_indices]
-        if self.method == "mtp":
-            hidden_states = target_hidden_states.view(-1, target_hidden_states.shape[-1])
-        else:
-            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         # [batch_size, hidden_size]
         hidden_states = hidden_states[last_token_indices]
@@ -184,6 +197,8 @@ class HpuEagleProposer(EagleProposer):
         common_attn_metadata,
         spec_decode_metadata: SpecDecodeMetadata,
         sampled_token_ids: list[list[int]],
+        *,
+        pad_slot_id: int | None = None,
     ):
         assert spec_decode_metadata is not None
         num_draft_tokens = \
@@ -223,14 +238,15 @@ class HpuEagleProposer(EagleProposer):
             logger.debug("[GLM] draft pad-lane fix active: padded lanes routed to the pad slot")
         if bool(pad_mask.any()):
             sm = getattr(common_attn_metadata, "slot_mapping", None)
-            # The base proposer accepts `runner` but never stores it, so there is
-            # no self.runner to read _PAD_SLOT_ID from here; -1 is the runner's
-            # own (_PAD_SLOT_ID) value and the "garbage slot" the conv path
-            # uses for padded lanes.
-            pad_slot = getattr(getattr(self, "runner", None), "_PAD_SLOT_ID", -1)
-            if sm is not None and sm.numel() >= pad_mask.numel():
+            if sm is not None:
+                # MLA uses index_copy directly: a negative sentinel is not safe.
+                # The caller owns the reserved cache slot, not the proposer.
+                if pad_slot_id is None or pad_slot_id < 0:
+                    raise ValueError("Rejected draft lanes require a nonnegative reserved pad_slot_id")
+                if sm.numel() < pad_mask.numel():
+                    raise ValueError("slot_mapping is shorter than the draft lane mask")
                 flat = sm.reshape(-1).clone()
-                flat[:pad_mask.numel()][pad_mask] = pad_slot
+                flat[:pad_mask.numel()][pad_mask] = pad_slot_id
                 common_attn_metadata = dataclasses.replace(common_attn_metadata, slot_mapping=flat.view_as(sm))
 
         return common_attn_metadata, hidden_states_indices, last_token_indices
@@ -243,7 +259,7 @@ class HpuEagleProposer(EagleProposer):
             positions,
             model_runner):
         # Prepare attn metadata on CPU. (Improve for pure HPU based attn metadata preparation)
-        block_size = model_runner.block_size
+        block_size = model_runner.attn_block_size
         batch_size = positions.shape[0]
         exceeds_max_model_len = positions >= self.max_model_len
         clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
@@ -256,7 +272,10 @@ class HpuEagleProposer(EagleProposer):
         # block_tables_list is a nested list of shape [num_seq, num_blocks]
         # num_blocks should include the slots needed for the current token
         # positions are the context lengths, and we need +1 for num_blocks
-        num_blocks = torch.ceil((positions + 1) / block_size).int()
+        num_blocks = (clamped_positions // block_size + 1).int()
+        # Overflow lanes have no valid context, even though their model position
+        # is clamped to zero. Never read or overwrite the real position-zero KV.
+        num_blocks[exceeds_max_model_len] = 0
         num_blocks = num_blocks[:num_seq].tolist()
         block_tables_list = []
         _avail = block_table_cpu_tensor.shape[1]
@@ -297,6 +316,10 @@ class HpuEagleProposer(EagleProposer):
 
         # Calculate the slot mapping and fill with padding
         slot_mapping = block_ids * block_size + clamped_positions % block_size
+        if bool(exceeds_max_model_len.any()):
+            if model_runner._PAD_SLOT_ID < 0:
+                raise ValueError("Overflow draft lanes require a nonnegative reserved pad slot")
+            slot_mapping[exceeds_max_model_len] = model_runner._PAD_SLOT_ID
         dummy_slots = itertools.cycle(range(model_runner._PAD_SLOT_ID, model_runner._PAD_SLOT_ID + block_size))
         slot_mapping[num_seq:].apply_(lambda _, ds=dummy_slots: next(ds))
         # Slot mapping needs to be int64 (long) type
@@ -306,7 +329,8 @@ class HpuEagleProposer(EagleProposer):
             model_runner.get_habana_paged_attn_buffers(
                 block_tables_list,
                 slot_mapping.tolist(),
-                batch_size
+                batch_size,
+                block_size=block_size,
             )
 
         block_list_device = async_h2d_copy(block_list, device=self.device)

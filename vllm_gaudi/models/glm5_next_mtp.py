@@ -104,6 +104,8 @@ def _pad_slot_metadata(attn_metadata):
 # step) -- MTP-4 pays that four times per step. Set VLLM_GLM_MTP_DRAFT_GRAPH=0
 # to fall back to the eager draft (same numerics, no graph).
 _DRAFT_GRAPH = os.environ.get("VLLM_GLM_MTP_DRAFT_GRAPH", "1") == "1"
+# Experimental local opt-in: graph only the tensor work around eager attention.
+_SPLIT_GRAPH = os.environ.get("VLLM_GLM_MTP_SPLIT_GRAPH", "0") == "1"
 
 
 def _private_copy(module: nn.Module) -> nn.Module:
@@ -226,6 +228,39 @@ class _DraftGraphCore(nn.Module):
         return self.shared_head_norm(residual + x)
 
 
+class _DraftPreAttentionGraphCore(nn.Module):
+    """Private light weights; attention and its cache remain outside capture."""
+
+    def __init__(self, mtp: nn.Module, embed_tokens: nn.Module):
+        super().__init__()
+        self.embed_tokens = _private_copy(embed_tokens)
+        self.enorm = _private_copy(mtp.enorm)
+        self.hnorm = _private_copy(mtp.hnorm)
+        self.eh_proj = _private_copy(mtp.eh_proj)
+        self.input_layernorm = _private_copy(mtp.input_layernorm)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
+                hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        embedding = self.embed_tokens(input_ids)
+        embedding = torch.where(positions.unsqueeze(-1) == 0, 0, embedding)
+        residual, _ = self.eh_proj(torch.cat([self.enorm(embedding), self.hnorm(hidden_states)], dim=-1))
+        return residual, self.input_layernorm(residual)
+
+
+class _DraftPostAttentionGraphCore(nn.Module):
+    """Private norms with the same shared MoE ownership as the bypass core."""
+
+    def __init__(self, mtp: nn.Module):
+        super().__init__()
+        self.post_attention_layernorm = _private_copy(mtp.post_attention_layernorm)
+        self.shared_head_norm = _private_copy(mtp.shared_head_norm)
+        self.mlp = mtp.mlp
+
+    def forward(self, residual: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
+        states = residual + attention
+        return self.shared_head_norm(states + self.mlp(self.post_attention_layernorm(states)))
+
+
 class HpuGlm5NextMTPModel(nn.Module):
     """Draft head over the target's already-loaded MTP (layer 45) modules."""
 
@@ -241,15 +276,26 @@ class HpuGlm5NextMTPModel(nn.Module):
         # and capturing the same storage in two graphs makes replay fail with
         # "Neither storage attached to input tensor, not its view".
         self._shares_target_modules = True
+        self.requires_prompt_cache_fill = _DRAFT_ATTN and not bool(_ATTN_SCALE_FILE)
         # Held by reference on purpose: no parameters are copied or re-read.
         self.mtp = mtp
         self._target = target
         self.embed_tokens = target.model.embed_tokens
         self.lm_head = target.lm_head
         self.logits_processor = target.logits_processor
-        # The graphed core only covers the attention-bypassed path, which is
-        # the shipped default; with attention on, metadata must flow through
-        # the forward context and the eager path is used unchanged.
+        # Cores are built from the target's already-loaded, processed weights.
+        # Attention itself always uses the original modules and forward context.
+        self.pre_attention_graph_core = None
+        self.post_attention_graph_core = None
+        if _SPLIT_GRAPH and _DRAFT_GRAPH and _DRAFT_ATTN:
+            import habana_frameworks.torch as htorch
+            self.pre_attention_graph_core = htorch.hpu.wrap_in_hpu_graph(_DraftPreAttentionGraphCore(
+                mtp, self.embed_tokens),
+                                                                         disable_tensor_cache=True,
+                                                                         dry_run=False)
+            self.post_attention_graph_core = htorch.hpu.wrap_in_hpu_graph(_DraftPostAttentionGraphCore(mtp),
+                                                                          disable_tensor_cache=True,
+                                                                          dry_run=False)
         self.graph_core = None
         if _DRAFT_GRAPH and not _DRAFT_ATTN:
             import habana_frameworks.torch as htorch
@@ -320,14 +366,48 @@ class HpuGlm5NextMTPModel(nn.Module):
             # bugs, at the graph/eager seam this time.
             htcore.mark_step()
             return out
+        use_split = (self.pre_attention_graph_core is not None and self.post_attention_graph_core is not None
+                     and hidden_states.ndim == 3 and hidden_states.shape[1] == 1 and inputs_embeds is None
+                     and not _ATTN_SCALE_FILE)
+        forward_impl = self._forward_split if use_split else self._forward
         if attn_metadata is not None:
             if _DRAFT_ATTN and _ATTN_SCALE_FILE and _attn_scale() == _PADWRITE:
                 attn_metadata = _pad_slot_metadata(attn_metadata)
             from vllm.config import get_current_vllm_config
             from vllm.forward_context import set_forward_context
             with set_forward_context(attn_metadata, get_current_vllm_config()):
-                return self._forward(input_ids, positions, hidden_states, inputs_embeds)
-        return self._forward(input_ids, positions, hidden_states, inputs_embeds)
+                return forward_impl(input_ids, positions, hidden_states, inputs_embeds)
+        return forward_impl(input_ids, positions, hidden_states, inputs_embeds)
+
+    def _forward_split(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        import habana_frameworks.torch.core as htcore
+
+        batch = hidden_states.shape[0]
+        if input_ids.numel() != batch or positions.numel() != batch:
+            raise ValueError("MTP split graph requires one input id and position per decode lane.")
+        input_ids = input_ids.reshape(batch, 1)
+        positions = positions.reshape(batch, 1)
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        residual, attention_input = self.pre_attention_graph_core(input_ids, positions, hidden_states)
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        attention = self.mtp.self_attn(positions=positions, hidden_states=attention_input)
+        if attention.numel() != residual.numel():
+            raise ValueError("MTP attention output must preserve the input token and hidden dimensions.")
+        attention = attention.reshape_as(residual)
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        output = self.post_attention_graph_core(residual, attention)
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        return output
 
     def _forward(
         self,
@@ -386,6 +466,10 @@ class HpuGlm5NextMTPModel(nn.Module):
                 pass
             else:
                 x = self.mtp.self_attn(positions=positions, hidden_states=x)
+                if x.numel() != residual.numel():
+                    raise ValueError("MTP attention output must preserve the input token and hidden dimensions.")
+                # MLA flattens token axes; restore them before the residual add.
+                x = x.reshape_as(residual)
                 # PADWRITE discards the output exactly as scale 0 does; only the
                 # write destination differs, which is the variable under test.
                 scale = 0.0 if a == _PADWRITE else a

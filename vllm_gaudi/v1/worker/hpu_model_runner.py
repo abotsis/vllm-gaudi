@@ -1383,6 +1383,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ## universal buffer for input_ids and positions ##
         ## necessary being used by spec decode by following GPU impl ##
         self._draft_token_ids: Optional[Union[list[list[int]], torch.Tensor]] = None
+        self._draft_req_ids: Optional[list[str]] = None
         self.input_ids_cpu = torch.zeros(self.max_num_tokens,
                                          dtype=torch.int32,
                                          device="cpu",
@@ -4600,6 +4601,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Swap
             self.input_batch.swap_states(first_prompt_index, last_decode_index)
 
+    def _can_skip_terminal_mtp_draft(self, scheduler_output, warmup_mode: bool) -> bool:
+        """Skip a whole synchronous MTP proposal only after every real row finishes."""
+        if (warmup_mode or self.use_async_scheduling or self.speculative_config is None
+                or self.speculative_config.method != "mtp"):
+            return False
+        # Include intermediate prefills, not just rows that sampled this step:
+        # a mixed batch still needs their draft prompt-cache fill.
+        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        if not scheduled_req_ids:
+            return False
+        for req_id in scheduled_req_ids:
+            req_state = self.requests[req_id]
+            params = req_state.sampling_params
+            if params is None or params.max_tokens is None or len(req_state.output_token_ids) < params.max_tokens:
+                return False
+        return True
+
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         if self.scheduler_output is None:
@@ -4723,6 +4741,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # split) produces none and gets no sampled token, so the draft must
         # pair sampled tokens with batches through this list, not by index.
         prefill_batches_with_logits: list[int] = []
+        # Parallel sidecar: CPU prompt snapshot and row-local shifted inputs.
+        # Keep PrefillInputData/shallow_tuple's wire layout unchanged.
+        mtp_prompt_batches = []
         # Collect per-request prefill hidden states for prompt logprobs.
         prefill_hidden_states_for_logprobs: dict[str, torch.Tensor] = {}
         decode_sampled_token_ids_device = None
@@ -4761,6 +4782,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.event_start = self.profiler.get_timestamp_us()
                 self.profiler.start("internal", "prefill")
 
+                # Snapshot every real row before output_token_ids is updated.
+                mtp_prompt_batch = self._prepare_mtp_prompt_cache_fill(req_id,
+                                                                       token_ids,
+                                                                       logits_indices,
+                                                                       scheduler_output,
+                                                                       warmup_mode,
+                                                                       logits_requests=logits_requests)
+                mtp_prompt_batches.append(mtp_prompt_batch)
                 htorch.core.mark_step()
                 non_flattened_hidden_states, aux_hidden_states, \
                     sample_hidden_states, logits_device = \
@@ -4773,6 +4802,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         model_mm_kwargs=model_mm_kwargs,
                         warmup_mode=warmup_mode)
                 htorch.core.mark_step()
+                if mtp_prompt_batch is not None and not logits_requests:
+                    self.drafter.prefill_cache_only(mtp_prompt_batch["token_ids"], position_ids,
+                                                    non_flattened_hidden_states.reshape(*token_ids.shape, -1),
+                                                    attn_metadata)
+                    htorch.core.mark_step()
+                non_flattened_hidden_states, aux_hidden_states = self._snapshot_prefill_hidden_states(
+                    non_flattened_hidden_states, aux_hidden_states, logits_requests, req_id)
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
@@ -4798,7 +4834,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             sampler_output, sampling_metadata = self._run_sampling(batch_changed, logits_device, req_id,
                                                                                    logits_device.shape[0],
                                                                                    logits_requests)
-                            prefill_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
+                            sampled_prefill = sampler_output.sampled_token_ids.flatten()
+                            if mtp_prompt_batch is not None:
+                                sampled_prefill = sampled_prefill[:len(logits_requests)]
+                            prefill_sampled_token_ids.append(sampled_prefill)
                             prefill_sampled_requests.extend(logits_requests)
                             logprobs_segments.append((list(logits_requests), sampler_output.logprobs_tensors))
                 if self.is_driver_worker and self.profiler.enabled:
@@ -5117,8 +5156,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # No sampling happened means no tokens to draft from -- an intermediate
         # prefill chunk. The scheduler is not expecting draft tokens for it, so
         # clear them rather than leaving the previous step's behind.
-        if self.speculative_config and sampling_metadata is None:
+        if self.speculative_config and (sampling_metadata is None or getattr(self, "_skip_draft_proposal", False)
+                                        or self._can_skip_terminal_mtp_draft(scheduler_output, warmup_mode)):
             self._draft_token_ids = None
+            self._draft_req_ids = None
         elif self.speculative_config and not getattr(self, "_skip_draft_proposal", False):
             self._draft_token_ids = self.propose_draft_token_ids(
                 scheduler_output,
@@ -5135,7 +5176,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 num_decodes,
                 prefill_data if num_prefills > 0 else None,
                 decode_data if num_decodes > 0 else None,
-                prefill_batches_with_logits=prefill_batches_with_logits)
+                prefill_batches_with_logits=prefill_batches_with_logits,
+                mtp_prompt_batches=mtp_prompt_batches)
         ################## Spec Decode end ##################
 
         # Create output.
@@ -7112,6 +7154,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if cfg:
                 profile_bs = max(profile_bs, int(cfg.split(",")[0]))
         self._gdn_max_reqs = max(self._original_max_num_seqs, profile_bs)
+        speculative_groups = [
+            i for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec) and group.kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES
+        ]
+        speculative_group_offsets = {group: i for i, group in enumerate(speculative_groups)}
 
         # Mamba/GDN state tensors, keyed by (spec, position within the group).
         # Before vLLM #51718 a KV-cache-tensor entry listed at most one layer
@@ -7249,12 +7296,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # is stable across input-batch condense/swaps.
                         _spec_extra = 0
                         if self.speculative_config is not None:
-                            _spec_extra = (self.scheduler_config.max_num_seqs *
-                                           (self.speculative_config.num_speculative_tokens + 1))
-                            self._kda_private_base[group_idx] = num_blocks + 1
+                            group_stride = (self.scheduler_config.max_num_seqs *
+                                            (self.speculative_config.num_speculative_tokens + 1))
+                            _spec_extra = group_stride * len(speculative_groups)
+                            self._kda_private_base[group_idx] = (num_blocks + 1 +
+                                                                 speculative_group_offsets[group_idx] * group_stride)
 
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos,
-                                                                     num_blocks + 1 + _spec_extra)
+                        kv_caches[layer_name] = _mamba_state_tensors(
+                            kv_cache_spec, layer_pos, num_blocks + 1 + _spec_extra + int(_spec_extra > 0))
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             len(set(kv_cache_spec.dtypes)) > 1:
                         # Mixed-dtype standard Mamba2 (e.g. Nemotron-H: bf16
@@ -7336,12 +7385,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # is stable across input-batch condense/swaps.
                         _spec_extra = 0
                         if self.speculative_config is not None:
-                            _spec_extra = (self.scheduler_config.max_num_seqs *
-                                           (self.speculative_config.num_speculative_tokens + 1))
-                            self._kda_private_base[group_idx] = num_blocks + 1
+                            group_stride = (self.scheduler_config.max_num_seqs *
+                                            (self.speculative_config.num_speculative_tokens + 1))
+                            _spec_extra = group_stride * len(speculative_groups)
+                            self._kda_private_base[group_idx] = (num_blocks + 1 +
+                                                                 speculative_group_offsets[group_idx] * group_stride)
 
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos,
-                                                                     num_blocks + 1 + _spec_extra)
+                        kv_caches[layer_name] = _mamba_state_tensors(
+                            kv_cache_spec, layer_pos, num_blocks + 1 + _spec_extra + int(_spec_extra > 0))
                     elif isinstance(kv_cache_spec, MambaSpec):
                         kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, num_blocks + 1)
                     else:
@@ -7522,6 +7573,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=[
+                    group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config,
+                                                               max(self.max_model_len, self.max_encoder_len))
+                    for group in kv_cache_config.kv_cache_groups
+                    if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+                ],
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
                 is_pooling_model=self.is_pooling_model,
@@ -7619,14 +7676,93 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
+            self._draft_req_ids = None
             return None
-        req_ids = self.input_batch.req_ids
+        req_ids = self._draft_req_ids
+        if req_ids is None:
+            req_ids = self.input_batch.req_ids.copy()
         if isinstance(self._draft_token_ids, torch.Tensor):
             draft_token_ids = self._draft_token_ids.tolist()
         else:
             draft_token_ids = self._draft_token_ids
+        assert len(req_ids) == len(draft_token_ids), "Draft request IDs must match emitted rows"
         self._draft_token_ids = None
+        self._draft_req_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    def _snapshot_prefill_hidden_states(self, hidden_states, aux_hidden_states, logits_requests, req_ids):
+        """Own outputs retained past the next target forward, not immediate cache fills."""
+        deferred_draft = (bool(logits_requests) and self.speculative_config is not None
+                          and self.speculative_config.use_eagle() and hasattr(self, "drafter")
+                          and not getattr(self, "_skip_draft_proposal", False))
+        prompt_logprobs = any(rid in self.input_batch.num_prompt_logprobs for rid in req_ids)
+        if not deferred_draft and not prompt_logprobs:
+            return hidden_states, aux_hidden_states
+        # Graph replay returns persistent output storage. Keep the full rectangle
+        # (including intermediate rows of a mixed finishing batch) for the draft.
+        hidden_states = hidden_states.clone()
+        if deferred_draft and self.use_aux_hidden_state_outputs:
+            aux_hidden_states = [hidden.clone() for hidden in aux_hidden_states]
+        # Submit lazy copies before another target replay can overwrite its outputs.
+        # mark_step submits, but does not wait for device completion; explicitly
+        # finish these reads rather than relying on replay's stream ordering.
+        htorch.core.mark_step()
+        torch.hpu.synchronize()
+        return hidden_states, aux_hidden_states
+
+    def _prepare_mtp_prompt_cache_fill(self,
+                                       req_ids,
+                                       token_ids,
+                                       logits_indices,
+                                       scheduler_output,
+                                       warmup_mode,
+                                       logits_requests=None):
+        """Snapshot and shift rectangular MTP prompt rows before target execution.
+
+        Intermediate boundaries come from CPU history; finishing boundaries
+        remain pending until sampling. No device indices are read on the host.
+        """
+        if (warmup_mode or getattr(self, "_skip_draft_proposal", False) or not self.speculative_config):
+            return None
+        model = getattr(self.drafter, "model", None)
+        if isinstance(model, HpuModelAdapter):
+            model = model.model
+        if not getattr(model, "requires_prompt_cache_fill", False):
+            return None
+        if getattr(self, "use_async_scheduling", False):
+            raise NotImplementedError("MTP prompt cache fill does not support async scheduling")
+        if self.use_prefix_caching:
+            raise NotImplementedError("MTP prompt cache fill does not support prefix caching")
+        if getattr(self, "use_merged_prefill", False):
+            raise NotImplementedError("MTP prompt cache fill does not support merged prefill")
+        if token_ids.ndim != 2 or not req_ids or len(req_ids) > token_ids.shape[0]:
+            raise ValueError("MTP prompt cache fill requires rectangular request rows")
+        shifted = token_ids.clone()
+        rows = {}
+        finishing = []
+        for row, req_id in enumerate(req_ids):
+            if self.requests[req_id].output_token_ids:
+                raise NotImplementedError("MTP prompt cache fill does not support output recomputation")
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            query = int(scheduler_output.num_scheduled_tokens[req_id])
+            prompt = int(self.input_batch.num_prompt_tokens[req_idx])
+            if computed < 0 or query <= 0 or query > token_ids.shape[1] or computed + query > prompt:
+                raise ValueError("MTP prompt cache fill requires a valid nonempty prompt chunk")
+            rows[req_id] = (row, computed, query, prompt)
+            if computed + query < prompt:
+                shifted[row] = _shift_mtp_prompt_chunk(token_ids[row], self.input_batch.token_ids_cpu[req_idx],
+                                                       computed, query, prompt)
+            else:
+                shifted[row, :query - 1].copy_(token_ids[row, 1:query])
+                finishing.append(req_id)
+        if logits_requests is None:
+            logits_requests = finishing
+        if len(set(logits_requests)) != len(logits_requests) or set(logits_requests) != set(finishing):
+            raise ValueError("MTP logits requests must identify each finishing prompt exactly once")
+        if logits_indices.numel() < len(finishing):
+            raise ValueError("MTP finishing prompt is missing logits")
+        return {"token_ids": shifted, "rows": rows, "finishing": list(logits_requests)}
 
     def propose_draft_token_ids(
         self,
@@ -7645,7 +7781,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         prefill_data: Optional[PrefillInputData] = None,
         decode_data: Optional[DecodeInputData] = None,
         prefill_batches_with_logits: Optional[list[int]] = None,
+        mtp_prompt_batches=None,
     ) -> Union[list[list[int]], torch.Tensor]:
+        self._draft_req_ids = None
         if self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.propose_ngram_draft_token_ids(sampled_token_ids)
@@ -7653,7 +7791,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, EagleProposer)
 
             draft_token_ids = None
+            track_mtp_rows = any(batch is not None for batch in (mtp_prompt_batches or []))
+            if track_mtp_rows:
+                self._draft_req_ids = []
             if decode_data is not None:
+                if track_mtp_rows:
+                    self._draft_req_ids.extend(self.input_batch.req_ids[:num_decodes])
                 assert num_decodes is not None
                 draft_token_ids = self.propose_eagle_decode(
                     sampled_token_ids,
@@ -7699,7 +7842,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             logits_indices,
                             prefill_batch_start_idx,
                             sampled_idx=sampled_idx,
+                            mtp_prompt_batch=mtp_prompt_batches[idx] if mtp_prompt_batches else None,
                         )
+                        if track_mtp_rows:
+                            self._draft_req_ids.extend(logits_requests)
                         draft_token_ids_prefill.append(_draft_token_ids)
                     prefill_batch_start_idx += len(req_id)
 
@@ -7712,7 +7858,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Early exit if there is only one draft token to be generated.
             # [batch_size, 1]
 
-            if self.speculative_config.num_speculative_tokens == 1:
+            if self.speculative_config.num_speculative_tokens == 1 and draft_token_ids is not None:
                 return draft_token_ids.view(-1, 1)  # type: ignore
 
         return draft_token_ids
@@ -7754,7 +7900,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         common_attn_metadata, hidden_states_indices, last_token_indices = \
             self.drafter.prepare_inputs(common_attn_metadata,
                                         decode_data.spec_decode_metadata,
-                                        sampled_token_ids)
+                                        sampled_token_ids,
+                                        pad_slot_id=self._PAD_SLOT_ID)
 
         target_token_ids = decode_sampled_token_ids_tensor.reshape(-1, 1)[hidden_states_indices]
         target_positions = decode_data.position_ids[hidden_states_indices]
@@ -7786,6 +7933,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # The sequence start index of this prefill batch
         batch_start_idx,
         sampled_idx: Optional[int] = None,
+        mtp_prompt_batch=None,
     ):
         # `idx` indexes the prefill batches (hidden states); `sampled_idx`
         # indexes the sampled-token list, which only has entries for batches
@@ -7814,9 +7962,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             target_hidden_states = hidden_states
         next_token_ids = prefill_sampled_token_ids_tensor[sampled_idx]
+        if mtp_prompt_batch is not None:
+            # One whole rectangular first forward also fills intermediate rows.
+            # Only finishing rows contribute logits and later draft iterations.
+            target_token_ids = mtp_prompt_batch["token_ids"].clone()
+            finishing = mtp_prompt_batch["finishing"]
+            next_token_ids = next_token_ids.reshape(-1)
+            if next_token_ids.numel() < len(finishing):
+                raise ValueError("MTP sampled tokens are missing finishing rows")
+            last_indices = []
+            for sample_row, req_id in enumerate(finishing):
+                row, computed, query, prompt = mtp_prompt_batch["rows"][req_id]
+                target_token_ids[row, query - 1] = next_token_ids[sample_row]
+                last_indices.append(row * token_ids.shape[1] + query - 1)
+            last_token_indices = async_h2d_copy(last_indices, device=token_ids.device, dtype=torch.int64)
+            req_indices = [self.input_batch.req_id_to_index[rid] for rid in finishing]
+            prefill_batch_block_table = block_table_cpu_tensor[req_indices]
+            target_hidden_states = target_hidden_states.reshape(*token_ids.shape, -1)
+            return self.drafter.propose(target_token_ids, position_ids, target_hidden_states, last_token_indices,
+                                        attn_metadata, prefill_batch_block_table, self)
         # Follow GPU to shift input_tokens by one to the left
         # to match hidden_states
-        token_ids = token_ids.squeeze()
+        token_ids = token_ids.reshape(-1)
         target_token_ids = token_ids.clone()
         target_token_ids[:-1].copy_(token_ids[1:])
         target_token_ids[logits_indices] = next_token_ids
@@ -7849,6 +8016,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
 
 # --- Helper Functions ---
+def _shift_mtp_prompt_chunk(token_ids, prompt_token_ids_cpu, computed, query, prompt):
+    """Shift one real request, preserving its rectangular or flat bucket.
+
+    The boundary token is known on CPU for an intermediate initial prompt.
+    Padded lanes retain their original values and existing padding slot mapping.
+    The row-aware caller invokes this helper separately for each real row.
+    """
+    if token_ids.ndim not in (1, 2):
+        raise ValueError("MTP prompt tokens must have a flat or rectangular bucket")
+    capacity = token_ids.shape[-1]
+    end = computed + query
+    if computed < 0 or query <= 0 or query > capacity or end >= prompt:
+        raise ValueError("MTP cache-only fill requires a nonempty intermediate prompt chunk")
+    if isinstance(prompt_token_ids_cpu, torch.Tensor) and prompt_token_ids_cpu.device.type != "cpu":
+        raise ValueError("MTP boundary tokens must come from CPU prompt history")
+    if prompt > len(prompt_token_ids_cpu):
+        raise ValueError("MTP CPU prompt history is shorter than the prompt length")
+    shifted = token_ids.clone()
+    source = token_ids.reshape(-1)
+    destination = shifted.reshape(-1)
+    destination[:query - 1].copy_(source[1:query])
+    boundary = async_h2d_copy([int(prompt_token_ids_cpu[end])], device=token_ids.device, dtype=token_ids.dtype)
+    destination[query - 1:query].copy_(boundary)
+    return shifted
+
+
 def get_shape(data):
     """Recursively finds the shape of a nested tuple or list."""
     if isinstance(data, torch.Tensor):
