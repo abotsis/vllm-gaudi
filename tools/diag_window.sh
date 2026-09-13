@@ -5,6 +5,7 @@
 #   ROLE=parity  ./tools/diag_window.sh   # bucket-parity A/B: pin decode (bs, blocks) buckets, greedy serial-vs-concurrent
 #   ROLE=logits  ./tools/diag_window.sh   # raw per-row logits under graph replay for 8 identical prompts (sampler capture only)
 #   ROLE=state   ./tools/diag_window.sh   # per-layer incoming KDA state of co-batched identical requests under replay
+#   ROLE=gate    ./tools/diag_window.sh   # greedy capture/compare + bench (+ acceptance with NSPEC>0) + parity; GATE_LABEL, GATE_COMPARE, NSPEC
 #
 # Shared-box protocol (same as glm53-bench/boot_gate.sh): waits for all 8
 # compute nodes free via wait_cards.sh, records a claim in
@@ -49,7 +50,7 @@ echo "=== diag_window ROLE=$ROLE branch=$(git -C "$REPO" branch --show-current) 
 # (2, ctx) forward while a lone prompt runs (1, ctx). For parity, pin the
 # prompt bs bucket too (MIN=PBSD) so a lone prompt pads into the same recipe
 # as a co-batched pair. PBSD=2 ROLE=parity is the prefill-side A/B.
-if [ "$ROLE" = "parity" ] || [ "$ROLE" = "logits" ] || [ "$ROLE" = "state" ]; then
+if [ "$ROLE" = "parity" ] || [ "$ROLE" = "logits" ] || [ "$ROLE" = "state" ] || [ "$ROLE" = "gate" ]; then
   BS_MIN="${BS_MIN:-8}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-32}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-$PBSD}"
 else
   BS_MIN="${BS_MIN:-1}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-1}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-1}"
@@ -77,8 +78,15 @@ if [ "$ROLE" = "capture" ] || [ "$ROLE" = "logits" ] || [ "$ROLE" = "state" ]; t
   export VLLM_DIAG_LAYER_POSITIONS="${VLLM_DIAG_LAYER_POSITIONS:-0,1,2}"  # e.g. "2": positions 0,1 stay under graph replay
   rm -rf "$DIAG_DIR"
 fi
-echo "buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none} acc_par=$PT_HPU_LAZY_ACC_PAR_MODE tensor_cache=${VLLM_HPU_DECODE_TENSOR_CACHE:-default} allreduce_markstep=${VLLM_HPU_ALLREDUCE_MARKSTEP:-0} hidden_layers=${VLLM_CONFIG_HIDDEN_LAYERS:-unset}"
+echo "nspec=$NSPEC buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none} acc_par=$PT_HPU_LAZY_ACC_PAR_MODE tensor_cache=${VLLM_HPU_DECODE_TENSOR_CACHE:-default} allreduce_markstep=${VLLM_HPU_ALLREDUCE_MARKSTEP:-0} hidden_layers=${VLLM_CONFIG_HIDDEN_LAYERS:-unset}"
 
+# NSPEC>0 adds MTP speculative decoding (the diagnostic roles require NSPEC=0;
+# ROLE=gate is the one meant for it).
+NSPEC="${NSPEC:-0}"
+SPEC=()
+if [ "$NSPEC" -gt 0 ]; then
+  SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${NSPEC}}")
+fi
 PLUGIN_DIR="$($PY -c 'import vllm_gaudi, os; print(os.path.dirname(os.path.dirname(vllm_gaudi.__file__)))')"
 case "$PLUGIN_DIR" in */vllm-gaudi-fresh) : ;; *) echo "FATAL: vllm_gaudi resolves to '$PLUGIN_DIR'"; exit 1 ;; esac
 
@@ -94,6 +102,7 @@ cd "$REPO" || exit 1
   --no-async-scheduling --no-enable-prefix-caching \
   --chat-template "$MODEL/chat_template/chat_template.enable-thinking-switch.jinja" \
   --enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47 \
+  "${SPEC[@]}" \
   > "$LOG" 2>&1 &
 SERVER=$!
 cleanup() {
@@ -178,6 +187,25 @@ case "$ROLE" in
     sleep 3
     echo "--- per-row logit agreement under replay ---"
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PY" "$REPO/tools/diag_logits_rows.py" "$DIAG_DIR" | tee "$RUNDIR/diag_logits_rows_${STAMP}.txt"
+    ;;
+  gate)
+    # GATE_LABEL names the greedy capture (greedy_refs/<label>.json); GATE_COMPARE
+    # compares against an earlier capture (e.g. the same-tree nospec reference).
+    LABEL="${GATE_LABEL:-gate_${STAMP}}"
+    echo "--- greedy capture: $LABEL ${GATE_COMPARE:+(vs $GATE_COMPARE)} ---"
+    "$PY" "$BENCH/greedy_check.py" --base "http://127.0.0.1:$PORT/v1" --label "$LABEL" \
+      ${GATE_COMPARE:+--compare "$GATE_COMPARE"} || echo "greedy gate rc=$? (differences listed above)"
+    if [ "$NSPEC" -gt 0 ]; then
+      echo "--- aggregate acceptance (agg_probe) ---"
+      "$PY" "$BENCH/agg_probe.py" --base "http://127.0.0.1:$PORT/v1" --model glm-5.3-flash --label "$LABEL"
+    fi
+    echo "--- single-stream decode bench ---"
+    "$PY" "$BENCH/bench.py" --port "$PORT" --reps 3 --max-tokens 300 --label "$LABEL"
+    echo "--- serial-vs-concurrent parity (12 prompts) ---"
+    "$PY" "$REPO/tools/diag_window_driver.py" parity --base "http://127.0.0.1:$PORT/v1" \
+      --out "$RUNDIR/diag_parity_${LABEL}.json" || echo "parity rc=$?"
+    echo "--- forward shapes on rank 0 ---"
+    tr '\r' '\n' < "$LOG" | grep -E "Worker_TP0.*\[fwd\]" | sed 's/.*\[fwd\] //' | sort | uniq -c | sort -rn | head -12
     ;;
   parity)
     echo "--- greedy serial-vs-concurrent probe under pinned buckets ---"
