@@ -279,3 +279,18 @@ def test_split_forward_rows_math_and_inactive_no_copies(tmp_path, monkeypatch, l
     assert calls[0] is raw and calls[1] is x
     assert torch.equal(streams, original)
     assert diag._collector is None
+
+
+def test_allowed_positions_env_and_admission(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_DIAG_LAYER_POSITIONS", "2")
+    assert diag.allowed_positions() == [2]
+    runner = fixture(tmp_path)
+    # positions 0 and 1 are not admitted (they stay under graph replay); position 2 is.
+    assert ticket(runner, tmp_path, ["a"], position=0, prompt=True) is None
+    assert ticket(runner, tmp_path, ["a"], position=1) is None
+    selected = ticket(runner, tmp_path, ["a"], position=2)
+    assert selected is not None and selected["payload"]["records"][0]["output_position"] == 2
+    monkeypatch.setenv("VLLM_DIAG_LAYER_POSITIONS", "garbage")
+    assert diag.allowed_positions() == [0, 1, 2]
+    monkeypatch.delenv("VLLM_DIAG_LAYER_POSITIONS")
+    assert diag.allowed_positions() == [0, 1, 2]

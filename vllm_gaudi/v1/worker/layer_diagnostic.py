@@ -29,11 +29,28 @@ def cpu(tensor):
     return tensor.detach().to(device="cpu", non_blocking=False, copy=True)
 
 
+def allowed_positions():
+    """Output positions the layer capture admits (VLLM_DIAG_LAYER_POSITIONS, default 0,1,2).
+
+    Only admitted forwards bypass HPU graphs. Restricting to a later position
+    leaves the earlier steps under real graph replay, so the captured forward
+    sees state and caches exactly as replay wrote them.
+    """
+    raw = os.environ.get("VLLM_DIAG_LAYER_POSITIONS", "0,1,2")
+    try:
+        values = sorted({int(x) for x in raw.split(",") if x.strip() != ""})
+    except ValueError:
+        values = [0, 1, 2]
+    return values or [0, 1, 2]
+
+
 def prepare(runner, path, context, tokens, positions, metadata, logits_indices, mark_step, rank, baseline_graphs):
     """Independent admission; validate exact history before installing any collector."""
     ordinal = getattr(runner, "_diag_layer_calls", 0)
     if ordinal >= 9 or getattr(runner, "_diag_layer_bytes", 0) >= MAX_BYTES:
         return None
+    allowed = allowed_positions()
+    first_position = allowed[0]
     request_ids, logits_requests = context
     if runner.use_merged_prefill or tokens.ndim != 2 or positions.shape != tokens.shape:
         raise ValueError("Layer diagnostic requires rectangular unmerged inputs")
@@ -48,10 +65,10 @@ def prepare(runner, path, context, tokens, positions, metadata, logits_indices, 
             continue
         request = runner.requests[rid]
         position = len(request.output_token_ids)
-        if position >= 3 or (rid, position) in seen:
+        if position not in allowed or (rid, position) in seen:
             continue
         if rid not in admitted:
-            if position != 0 or len(admitted) >= 3:
+            if position != first_position or len(admitted) >= 3:
                 continue
             admitted.append(rid)
         if len(seen) >= 9:

@@ -73,6 +73,7 @@ export VLLM_PROMPT_QUERY_BUCKET_STEP=2048 VLLM_PROMPT_BS_BUCKET_MAX="$PBSD" VLLM
 export VLLM_DEBUG=fwd                      # [fwd] (phase, bs, query, blocks) trace per forward on every worker
 if [ "$ROLE" = "capture" ] || [ "$ROLE" = "logits" ]; then
   export VLLM_DIAG_SAMPLER_DIR="$DIAG_DIR"  # dir must NOT exist at boot: a stale sentinel disables capture for the runner
+  export VLLM_DIAG_LAYER_POSITIONS="${VLLM_DIAG_LAYER_POSITIONS:-0,1,2}"  # e.g. "2": positions 0,1 stay under graph replay
   rm -rf "$DIAG_DIR"
 fi
 echo "buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none} acc_par=$PT_HPU_LAZY_ACC_PAR_MODE tensor_cache=${VLLM_HPU_DECODE_TENSOR_CACHE:-default} allreduce_markstep=${VLLM_HPU_ALLREDUCE_MARKSTEP:-0} hidden_layers=${VLLM_CONFIG_HIDDEN_LAYERS:-unset}"
@@ -136,9 +137,14 @@ case "$ROLE" in
     mkdir -p "$DIAG_DIR" && chmod 700 "$DIAG_DIR"
     (umask 077; : > "$DIAG_DIR/ENABLED"; : > "$DIAG_DIR/LAYER_ENABLED")
     ls -la "$DIAG_DIR"
-    echo "--- driver: A alone, then B+C staggered ---"
-    "$PY" "$REPO/tools/diag_window_driver.py" capture --base "http://127.0.0.1:$PORT/v1" \
-      --out "$RUNDIR/diag_capture_${STAMP}.json"
+    if [ -n "${CAPTURE_CMD:-}" ]; then
+      echo "--- driver (CAPTURE_CMD): $CAPTURE_CMD ---"
+      bash -c "$CAPTURE_CMD" || echo "capture driver rc=$?"
+    else
+      echo "--- driver: A alone, then B+C staggered ---"
+      "$PY" "$REPO/tools/diag_window_driver.py" capture --base "http://127.0.0.1:$PORT/v1" \
+        --out "$RUNDIR/diag_capture_${STAMP}.json"
+    fi
     sleep 5
     echo "--- [fwd] trace on rank 0 since arming ---"
     tr '\r' '\n' < "$LOG" | grep -E "Worker_TP0.*\[fwd\]" | tail -12
@@ -148,9 +154,9 @@ case "$ROLE" in
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PY" "$REPO/tools/diag_compare.py" export --auto --dir "$DIAG_DIR" \
       --out "$RUNDIR/kda_comparison_${STAMP}.json" \
       || echo "export failed: check inventory and re-run diag_compare by hand (pair syntax orda:idxa>ordb:idxb)"
-    echo "--- layer-0 KDA interior, first fork pair ---"
+    echo "--- compare (all pairs, non-identical rows and routing flips) ---"
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PY" "$REPO/tools/diag_compare.py" compare --auto --dir "$DIAG_DIR" \
-      | grep -E "^====|layers\.0\.|final_norm|unavailable|^    - " | head -80
+      > "$RUNDIR/diag_compare_${STAMP}.txt"; grep -E "^auto pair|^====|\[ulp|\[small|\[BIG|FLIP|unavailable" "$RUNDIR/diag_compare_${STAMP}.txt" | head -120
     ;;
   logits)
     echo "--- arming raw-logits sampler capture only (ENABLED, no LAYER_ENABLED: graphs still replayed) ---"

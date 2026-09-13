@@ -183,7 +183,7 @@ def run_logits(args):
     --max-tokens: the capture budget is 64 MiB of bf16 logits per rank."""
     prompt = {**PROMPTS, **DELTA_PROMPTS}[args.prompt]
     out = {"mode": "logits", "prompt": args.prompt, "max_tokens": args.max_tokens}
-    out["serial"] = ask(args.base, args.model, prompt, args.max_tokens)["text"]
+    out["serial"] = None if args.concurrent_only else ask(args.base, args.model, prompt, args.max_tokens)["text"]
     time.sleep(args.gap)
     barrier = threading.Barrier(8)
 
@@ -209,6 +209,7 @@ def main():
     ap.add_argument("--stagger", type=float, default=50.0, help="ms between B and C (capture)")
     ap.add_argument("--gap", type=float, default=2.0, help="s to let the engine drain between phases")
     ap.add_argument("--no-delta", action="store_true", help="parity: omit the JSON first-token reproducer prompts")
+    ap.add_argument("--concurrent-only", action="store_true", help="logits: skip the serial run (capture budget)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.max_tokens is None:
