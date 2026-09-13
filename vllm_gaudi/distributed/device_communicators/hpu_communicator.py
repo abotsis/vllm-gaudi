@@ -30,6 +30,12 @@ _ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "0") == "1"
 _ALLREDUCE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "hccl").strip().lower()
 if _ALLREDUCE_MODE not in ("hccl", "fp32", "gather_sum"):
     raise ValueError(f"VLLM_HPU_ALLREDUCE_MODE must be hccl, fp32 or gather_sum, got {_ALLREDUCE_MODE!r}")
+# Inputs whose gathered/upcast working buffer would exceed this fall back to the
+# plain HCCL all-reduce. Every all-reduce site inside a captured graph retains
+# its working buffers, and a 3200-token prefill has ~88 sites: gather_sum at
+# that size (8 x 26 MiB per site) failed device allocation during warmup.
+# Decode buffers ([bs, hidden]) are far below the default.
+_ALLREDUCE_ALT_MAX_BYTES = int(os.environ.get("VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES", str(16 * 1024 * 1024)))
 
 
 def sum_in_rank_order(gathered: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -84,13 +90,15 @@ class HpuCommunicator(DeviceCommunicatorBase):
         # the graph. VLLM_HPU_ALLREDUCE_MARKSTEP=1 restores the old behaviour.
         if _ALLREDUCE_MARKSTEP:
             htorch.core.mark_step()
-        if _ALLREDUCE_MODE == "gather_sum":
+        working_bytes = input_.numel() * input_.element_size() * (self.world_size
+                                                                  if _ALLREDUCE_MODE == "gather_sum" else 2)
+        if _ALLREDUCE_MODE == "gather_sum" and working_bytes <= _ALLREDUCE_ALT_MAX_BYTES:
             flat = input_.contiguous()
             gathered = torch.empty((self.world_size, ) + tuple(flat.shape), dtype=flat.dtype, device=flat.device)
             dist.all_gather_into_tensor(gathered, flat, group=self.device_group)
             input_.copy_(sum_in_rank_order(gathered, input_.dtype))
             return input_
-        if _ALLREDUCE_MODE == "fp32":
+        if _ALLREDUCE_MODE == "fp32" and working_bytes <= _ALLREDUCE_ALT_MAX_BYTES:
             upcast = input_.float()
             dist.all_reduce(upcast, group=self.device_group)
             input_.copy_(upcast.to(input_.dtype))
