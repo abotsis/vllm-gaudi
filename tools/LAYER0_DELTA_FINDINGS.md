@@ -241,3 +241,28 @@ boots were MTP; no same-boot single-knob A/B exists. Also: the HPU logprob
 reporting is corrupted in several first_logits entries (duplicate values, an
 unsorted top list whose chosen token is not the max, a -9999 sentinel), so
 reported logprobs are not usable as parity evidence.
+
+## 8. State at end of 2026-09-12 (all CPU-side; nothing HPU-verified today)
+
+Branch `fix/glm53-kda-transition`, six commits over 7a44eab6:
+
+| commit | content | HPU status |
+|---|---|---|
+| 45505b1a | KDA chunk-transition transpose fix + oracle test | verified 09-10 (kdafix 8/8) |
+| 672b3eb3 | spec-decode/MTP fixes (candidate conv, pad slots, prompt-cache fill, MTP reshape) | validated 09-11 PBSD2 boot |
+| 129ee324 | diagnostics + comparator + window scripts (incl. KDA-interior hooks) | KDA hooks never run on HPU |
+| 4444942c | sampled-logprob host ownership; blocking prompt-logprob copies | **unverified**: rerun the first-token probe with logprobs on |
+| ea535226 | MoE routing capture + offline top-k margins; prompt-bucket parity; delta prompts | never run on HPU |
+| b7036c08 | test hygiene (default dtype restore) | n/a |
+
+**Window checklist (in order):**
+1. `ROLE=parity ./tools/diag_window.sh` (nospec, bf16 mHC, PBSD=1). Expect 12/12
+   serial == concurrent. Then `PBSD=2 ROLE=parity` for the prefill side.
+2. `ROLE=capture ./tools/diag_window.sh`. In the compare output look for the
+   first `[ulp]`/`[small]` row under `model.layers.0.kda.*` (seed op, §7 tree),
+   then the `[ROUTE] ... experts FLIP` rows: the layer of the first flip should
+   coincide with the first jump in the per-layer relL2 profile, and its margin
+   should be of the order of the upstream delta.
+3. Logprob check: `probe_first_logits.py` pattern (logprobs=True, top_logprobs=5)
+   on any boot; every entry must have a sorted top list whose first value equals
+   the chosen token's logprob, no duplicate tokens, no -9999.
