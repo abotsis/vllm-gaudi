@@ -110,6 +110,40 @@ Any value the user sets explicitly wins over every plugin default.
   or mamba-block-aligned prefill) produce no draft tokens themselves; drafts
   are paired with the batch that produced the logits.
 
+## Determinism under concurrency
+
+Two separate effects make a co-batched request's greedy output differ from
+the same request served alone. They were separated on 2026-09-13 with
+`tools/diag_window.sh` (see `tools/LAYER0_DELTA_FINDINGS.md`):
+
+1. **All-reduce row order (a bug, fixed by default).** HCCL's all-reduce sums
+   each chunk of the `[bs, hidden]` buffer in a chunk-dependent rank order.
+   At decode a chunk is one row, so a row's residual stream after `o_proj`
+   and the MoE down-projection depended on its position in the batch by
+   about one bf16 ULP. GLM-5.3 keeps that ULP in the KDA recurrent state of
+   every layer after the first, and expert routing at near-ties turns it into
+   different tokens: eight identical prompts decoded together produced seven
+   different texts. `VLLM_HPU_ALLREDUCE_MODE=gather_sum` (default) all-gathers
+   the partials and sums them in rank order in fp32, which is position
+   independent; with it the eight prompts produce one text. No measurable
+   decode cost (single-stream 14.7 vs 13.6 tok/s, within restart noise).
+   Buffers above `VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES` (16 MiB) fall back to
+   `hccl`, because every all-reduce site inside a captured prefill graph
+   retains its working buffers. `hccl` restores the old behaviour.
+2. **Batch-shape numerics (inherent).** A lone decode runs the bs=1 recipe, a
+   full batch the bs=8 one; GEMM and attention kernels round differently at
+   different shapes, exactly as on other accelerators. With gather_sum alone,
+   serial vs concurrent greedy parity on the 12-prompt probe was 7/12 on the
+   default bucket ladder. For bit-exact parity pin every decode to one
+   recipe: `VLLM_DECODE_BS_BUCKET_MIN=8 VLLM_DECODE_BS_BUCKET_STEP=8
+   VLLM_DECODE_BLOCK_BUCKET_MIN=32` (and `VLLM_PROMPT_BS_BUCKET_MIN` equal to
+   the prompt bucket max when co-batched prefill is on): 12/12 identical, at
+   the cost of running lone decodes as 8-row batches (see the findings doc
+   for the measured cost).
+
+Tools: `tools/diag_window_driver.py rowdep` (identical prompts must give
+identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.
+
 ## Performance notes on this port
 
 - `VLLM_HPU_DECODE_TENSOR_CACHE` keeps the HPU-graph tensor cache for decode

@@ -42,3 +42,9 @@ def test_all_reduce_dispatches_on_mode():
     assert "_ALLREDUCE_MODE == 'gather_sum'" in src and "all_gather_into_tensor" in src
     assert "_ALLREDUCE_MODE == 'fp32'" in src
     assert src.count("dist.all_reduce(") == 2  # fp32 path and default path
+
+
+def test_default_mode_is_gather_sum_with_a_size_cap():
+    src = SRC.read_text()
+    assert 'os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "gather_sum")' in src
+    assert "_ALLREDUCE_ALT_MAX_BYTES" in src and "16 * 1024 * 1024" in src

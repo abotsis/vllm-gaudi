@@ -20,14 +20,22 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata
 _ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "0") == "1"
 
 # VLLM_HPU_ALLREDUCE_MODE selects how the TP/EP all-reduce sums partials:
-#   hccl       (default) dist.all_reduce in the tensor's dtype.
+#   gather_sum (default) all_gather the partials and sum them on every rank in
+#              rank order in fp32. The result is independent of which rank
+#              owned which chunk of the buffer. HCCL's all-reduce sums each
+#              chunk in a chunk-dependent rank order; at [bs, hidden] a chunk
+#              is one decode row, so with it a row's residual after o_proj /
+#              MoE down-proj depended on its position in the batch by ~1 bf16
+#              ULP. On GLM-5.3 (recurrent state + MoE routing at near-ties)
+#              that turned into different greedy tokens for co-batched
+#              requests: 8 identical prompts at once gave 7 texts; with
+#              gather_sum 1 text, and serial vs concurrent 12/12 identical
+#              under pinned buckets. Measured decode cost: none (14.7 vs 13.6
+#              tok/s single-stream, restart noise). Bounded by
+#              VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES; larger buffers use hccl.
 #   fp32       upcast, dist.all_reduce, downcast: fewer order-dependent roundings.
-#   gather_sum all_gather the partials and sum them on every rank in rank order
-#              in fp32: the result is independent of which rank owned which
-#              chunk of the buffer, i.e. identical rows of a batch stay
-#              identical (a reduce-scatter based all-reduce sums each chunk, one
-#              decode row each at [8, hidden], in a different rank order).
-_ALLREDUCE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "hccl").strip().lower()
+#   hccl       dist.all_reduce in the tensor's dtype (previous behaviour).
+_ALLREDUCE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "gather_sum").strip().lower()
 if _ALLREDUCE_MODE not in ("hccl", "fp32", "gather_sum"):
     raise ValueError(f"VLLM_HPU_ALLREDUCE_MODE must be hccl, fp32 or gather_sum, got {_ALLREDUCE_MODE!r}")
 # Inputs whose gathered/upcast working buffer would exceed this fall back to the
