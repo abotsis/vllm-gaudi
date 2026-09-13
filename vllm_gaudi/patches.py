@@ -277,7 +277,12 @@ def _hpu_gather_logprobs(
     token_ranks = _sampler_mod.batched_count_greater_than(logprobs, token_logprobs)
     indices = torch.cat((token_ids, topk_indices), dim=1)
     logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
-    indices = indices.to(torch.int32)
+    # Upstream narrows ``indices`` to int32 here to save bytes. On HPU the very
+    # first execution of that cat->int32 recipe in a process returned token ids
+    # read at the wrong stride (every other id, then zeros) while the logprob
+    # values were right, producing top_logprobs rows with duplicate tokens and
+    # -inf for the chosen token. The ids are consumed on the host as Python
+    # ints, so keep them int64 and skip the narrowing cast.
     return LogprobsTensors(indices, logprobs, token_ranks)
 
 

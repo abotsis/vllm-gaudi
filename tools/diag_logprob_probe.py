@@ -19,7 +19,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from diag_window_driver import DELTA_PROMPTS  # noqa: E402
 
 
-def ask(base, model, prompt, timeout=300):
+def ask(base, model, prompt, timeout=300, top_logprobs=5):
     body = dict(model=model,
                 messages=[dict(role="user", content=prompt)],
                 temperature=0,
@@ -27,7 +27,7 @@ def ask(base, model, prompt, timeout=300):
                 seed=0,
                 max_tokens=1,
                 logprobs=True,
-                top_logprobs=5,
+                top_logprobs=top_logprobs,
                 chat_template_kwargs=dict(enable_thinking=False))
     req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
                                  data=json.dumps(body).encode(),
@@ -64,6 +64,11 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default="glm-5.3-flash")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--k-sweep",
+                    type=int,
+                    nargs="*",
+                    default=[3, 8, 1],
+                    help="extra single requests with these top_logprobs values after the reps")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     names = list(DELTA_PROMPTS)
@@ -87,6 +92,19 @@ def main():
                 flag = "BAD " if issues else "ok  "
                 top = summary["top"][:3] if summary else None
                 print(f"rep{rep} {phase:10s} {n:8s} {flag} {issues or ''} {top}", flush=True)
+    # New top_logprobs values compile new gather recipes: does the first
+    # execution of each one misbehave (per-recipe), or only the first in the
+    # process (already consumed above)?
+    for k in args.k_sweep:
+        resp = ask(args.base, args.model, DELTA_PROMPTS["j_alpha"], top_logprobs=k)
+        issues, summary = check(resp)
+        total += 1
+        bad += bool(issues)
+        records.append(dict(rep=-1, phase=f"k={k}", name="j_alpha", issues=issues, summary=summary))
+        print(
+            f"k-sweep top_logprobs={k:2d} {'BAD ' if issues else 'ok  '} {issues or ''} "
+            f"{summary['top'][:3] if summary else None}",
+            flush=True)
     with open(args.out, "w") as f:
         json.dump(records, f, indent=1)
     print(f"\n{total - bad}/{total} consistent; wrote {args.out}")
