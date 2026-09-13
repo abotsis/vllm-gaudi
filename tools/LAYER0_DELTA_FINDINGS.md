@@ -305,3 +305,41 @@ Tooling notes: `diag_compare --auto` now picks the reference by fewest
 admitted records (under padded buckets every forward is 8 wide);
 `diag_window_driver.py rowdep` is the replay row-dependence probe;
 `LOGPROB_PROBE=1` / `PRE_ARM_HOOK=` run on the live server before any capture.
+
+## 10. 2026-09-13 afternoon: the defect is row-position dependent under replay, entering at layer 0's output
+
+Boots (all pinned buckets, nospec, bf16 mHC):
+
+| boot | knob | rowdep (8 identical `prose`) | parity |
+|---|---|---|---|
+| TC off | VLLM_HPU_DECODE_TENSOR_CACHE=0 | 7 distinct, 2/8 == serial | 8/12 |
+| mark_steps | ALLREDUCE_MARKSTEP=1, CONFIG_HIDDEN_LAYERS=1 | 7 distinct, 2/8 | 10/12 |
+| acc_par 0 | PT_HPU_LAZY_ACC_PAR_MODE=0 | 7 distinct, 2/8 | (logits role) |
+
+None of those knobs matter. What does:
+
+- **Raw logits under replay, aligned by position** (`ROLE=logits`): batch rows
+  0 and 1 are bit-identical to the serial run at every position; rows 2-7
+  differ by 1-4 logit units from position 1 on, and only flip the argmax at a
+  near-tie (position 12, serial top-2 margin 0.000).
+- **Lazy capture at position 2 only** (`VLLM_DIAG_LAYER_POSITIONS=2`): the
+  request moved from index 7 to index 0 by a batch condense has layer 0
+  bit-identical to the correct row (incoming KDA state included, output
+  included) and differs from layer 1 on; 18 expert-routing flips follow.
+- **Per-layer KDA state under replay** (`ROLE=state`): at position 2 the
+  correct row (index 1) and the wrong row (index 2) agree on layer 0's conv
+  and recurrent pools and disagree on every other layer's, by ~1 bf16 ULP in
+  the conv pools (which hold each layer's qkv projection of its input).
+
+Reading: layer 0's recurrent update is exact for every row, so the replayed
+step computed layer 0's **output** differently for rows >= 2: downstream of
+the state update, i.e. gate / gated norm / o_proj / **TP all-reduce** / mHC.
+A rounding-level difference that is deterministic by row index in an 8-row
+batch, identical for rows 0 and 1, is what a reduce-scatter all-reduce gives:
+the [8, hidden] bf16 buffer is split into per-rank chunks (one decode row
+each) and each chunk is summed in a different rank order. Serial row 0 and
+concurrent row 0 share chunk 0, hence "serial is correct". The hybrid model
+keeps the ULP in its recurrent state and MoE routing flips amplify it.
+
+Test in flight: `VLLM_HPU_ALLREDUCE_MODE=gather_sum` (all_gather + fixed-order
+fp32 sum, commit 01e15a3f). Prediction: rowdep 1 distinct 8/8 and parity 12/12.
