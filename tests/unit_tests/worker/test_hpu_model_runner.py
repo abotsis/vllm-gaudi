@@ -98,6 +98,16 @@ def get_vllm_config():
     return vllm_config
 
 
+@pytest.fixture(autouse=True)
+def _restore_default_dtype():
+    """Several tests below set the default dtype to bfloat16 and never restore it,
+    which silently changes the numerics of every test collected after this file
+    (e.g. the CPU KDA oracle tests). Restore it per test."""
+    previous = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(previous)
+
+
 @pytest.fixture
 def model_runner():
     vllm_config = get_vllm_config()
