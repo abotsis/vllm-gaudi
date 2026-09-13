@@ -370,3 +370,36 @@ Unpinned-ladder parity and the decode-throughput cost of gather_sum are
 measured in the boots that follow; the first gather_sum attempt without the
 size cap died in prefill warmup (PT_DEVMEM: 8x buffers retained per
 all-reduce site inside captured graphs).
+
+## 12. Final numbers (2026-09-13 16:06-16:58) and the shipped recipe
+
+Single-stream decode, `bench.py --reps 3 --max-tokens 300`, median tok/s, one
+boot each, same day:
+
+| boot | all-reduce | buckets | tok/s | 12-prompt parity |
+|---|---|---|---|---|
+| baseline | hccl | default ladder | 13.61 | 7/12 |
+| A | gather_sum | default ladder | 14.68 | 7/12 |
+| C | gather_sum (default now) | pinned (8,8,8)/(32,512,3200) | 15.02 | **12/12** |
+
+Restart noise on this box is ~6%, so all three are the same speed. Decisions:
+
+- `VLLM_HPU_ALLREDUCE_MODE` defaults to `gather_sum` (commit 789f75ce). It
+  removes the row-position dependence (identical rows are identical, each
+  batch composition is deterministic) at no measurable cost. `hccl` restores
+  the previous behaviour.
+- Bit-exact serial-vs-concurrent parity additionally needs one decode recipe:
+  `VLLM_DECODE_BS_BUCKET_MIN=8 VLLM_DECODE_BS_BUCKET_STEP=8
+  VLLM_DECODE_BLOCK_BUCKET_MIN=32` at `--max-num-seqs 8`. Free at bs 8, and
+  warmup drops from ~13 to ~2 minutes (one decode bucket). Not made a plugin
+  default: at larger max_num_seqs the padded lone decode may cost real time,
+  measure before adopting. Documented in docs/features/glm53_flash.md.
+- Everything else tested today is exonerated: bucket shape as a *bug* (it only
+  selected the chunk order), decode tensor cache, all-reduce/per-layer
+  mark_steps, lazy accumulation-parallel mode, KDA state handling, MoE
+  routing, fp8 activation scaling (per-token).
+
+Open items carried forward: MTP (nspec) parity was never re-measured with the
+fix; the previous 4/8-vs-nospec numbers should be redone with gather_sum and
+pinned buckets. Prefill co-batching (PBSD=2) parity with the fix is also
+untested today (all boots ran prompt bs 1).

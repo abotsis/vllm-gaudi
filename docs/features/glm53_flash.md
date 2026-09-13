@@ -137,9 +137,11 @@ the same request served alone. They were separated on 2026-09-13 with
    default bucket ladder. For bit-exact parity pin every decode to one
    recipe: `VLLM_DECODE_BS_BUCKET_MIN=8 VLLM_DECODE_BS_BUCKET_STEP=8
    VLLM_DECODE_BLOCK_BUCKET_MIN=32` (and `VLLM_PROMPT_BS_BUCKET_MIN` equal to
-   the prompt bucket max when co-batched prefill is on): 12/12 identical, at
-   the cost of running lone decodes as 8-row batches (see the findings doc
-   for the measured cost).
+   the prompt bucket max when co-batched prefill is on): 12/12 identical.
+   Measured at `--max-num-seqs 8`: 15.0 tok/s single-stream vs 14.7 on the
+   default ladder (same within restart noise), and warmup drops from ~13 to
+   ~2 minutes because there is one decode bucket. At larger max_num_seqs the
+   padded lone decode may cost real time; measure before adopting.
 
 Tools: `tools/diag_window_driver.py rowdep` (identical prompts must give
 identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.
