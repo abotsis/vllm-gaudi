@@ -30,6 +30,7 @@ import os
 import torch
 from vllm_gaudi.ops.hpu_gdn_pytorch import _hpu_solve_lower_triangular_batched
 
+
 def _kda_prefix_states(m_full, n_t, x0):
     """All per-chunk entry states of the affine recurrence, final state.
 
@@ -240,7 +241,7 @@ def hpu_chunk_kda(
     r = torch.matmul(kk.transpose(-1, -2), w_h5)  # [S,C,H,D,D]
     alpha = gs_last.exp().squeeze(-2)  # [S,C,H,D]
     eye_d = torch.eye(D, dtype=torch.float32, device=device)
-    m_full = alpha.unsqueeze(-1) * eye_d - r.transpose(-1, -2)  # [S,C,H,D,D]
+    m_full = alpha.unsqueeze(-1) * eye_d - r  # [S,C,H,D,D]
 
     x0 = (torch.zeros(S, H, D, Vdim, dtype=torch.float32, device=device)
           if initial_state is None else initial_state.float().contiguous())
