@@ -403,3 +403,28 @@ Open items carried forward: MTP (nspec) parity was never re-measured with the
 fix; the previous 4/8-vs-nospec numbers should be redone with gather_sum and
 pinned buckets. Prefill co-batching (PBSD=2) parity with the fix is also
 untested today (all boots ran prompt bs 1).
+
+## 13. MTP-4 re-verified on the fixed tree (2026-09-13 17:31)
+
+Same recipe as §12 boot C (gather_sum default, pinned buckets, prompt bs 1),
+`--speculative-config {"method":"mtp","num_speculative_tokens":4}`, draft graph
+on, draft attention bypassed (shipped defaults). Reference = same-tree nospec
+capture `greedy_refs/nospec_gs_pinned.json` taken one boot earlier.
+
+| metric | MTP-4 today | nospec today | previous MTP records |
+|---|---|---|---|
+| greedy vs nospec (8 prompts) | 3/8 identical; all 5 divergences at the known near-tie chars (81, 138, 105, 273, 647), coherent both sides | n/a | 4/8 (09-11), 3/8 (09-10) |
+| serial vs concurrent parity (12 prompts) | **12/12** | 12/12 | never clean |
+| mean accepted length | **2.405** | n/a | 2.06 (09-10), 2.27 (09-02) |
+| per-position acceptance | 0.824 / 0.444 / 0.126 / 0.010 | n/a | 0.716 / 0.274 / 0.062 / 0.005 |
+| aggregate mixed throughput (agg_probe) | **20.16 tok/s** | n/a | 15.4-19.5 |
+| single-stream decode (bench.py, prose prompt) | **17.26 tok/s** (1.23x) | 14.01 | 16.8 prose (09-02, vs 10.5 base) |
+
+Reading: the MTP path is deterministic across batch composition now, and
+acceptance is the best measured on this port (a corrupted residual stream in
+rows >= 2 was also degrading the draft's inputs). The remaining MTP-vs-nospec
+divergences are the verify step's 5-position kernel shape vs a 1-position
+decode, the same class as the default-ladder 7/12, not a speculation defect.
+
+Still open: draft self-attention stays bypassed (its KV slot wiring, STATUS §7
+item 3); co-batched prefill (PBSD=2) parity untested on the fixed tree.
