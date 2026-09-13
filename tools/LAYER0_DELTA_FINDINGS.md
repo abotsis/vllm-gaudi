@@ -343,3 +343,30 @@ keeps the ULP in its recurrent state and MoE routing flips amplify it.
 
 Test in flight: `VLLM_HPU_ALLREDUCE_MODE=gather_sum` (all_gather + fixed-order
 fp32 sum, commit 01e15a3f). Prediction: rowdep 1 distinct 8/8 and parity 12/12.
+
+## 11. Confirmed (2026-09-13 16:06): the TP/EP all-reduce is not row-invariant
+
+`VLLM_HPU_ALLREDUCE_MODE=gather_sum` (commit 01e15a3f + 16 MiB working-buffer
+cap 11b2489a), pinned buckets, nospec, bf16 mHC:
+
+| probe | before | with gather_sum |
+|---|---|---|
+| 8 identical `prose` at once | 7 distinct texts, 2/8 == serial | **1 text, 8/8 == serial** |
+| 8 identical `j_delta` at once | 5 distinct, 2/8 | **1 text, 8/8** |
+| condense cases | mixed | **both match serial** |
+| 12-prompt serial vs concurrent | 8-10/12 | **12/12** |
+
+Root cause: HCCL's all-reduce sums each chunk of the buffer in a rank order
+that depends on the chunk index; at [8, hidden] a chunk is one decode row, so
+a row's residual-stream value after o_proj / MoE down-proj depends on its
+position in the batch by ~1 bf16 ULP. A lone request always sits at row 0,
+hence "serial is right". GLM-5.3 carries the ULP in the KDA recurrent state of
+every layer after the first and MoE routing flips at near-ties turn it into
+different greedy tokens. Nothing in KDA, MoE, the tensor cache, mark_step
+policy, lazy accumulation mode or bucket shapes is at fault; bucket shape
+only changed which chunk order a row received (the 09-11 layer-0 delta).
+
+Unpinned-ladder parity and the decode-throughput cost of gather_sum are
+measured in the boots that follow; the first gather_sum attempt without the
+size cap died in prefill warmup (PT_DEVMEM: 8x buffers retained per
+all-reduce site inside captured graphs).
