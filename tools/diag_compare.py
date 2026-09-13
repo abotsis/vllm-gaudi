@@ -219,26 +219,28 @@ def auto_pairs(data):
     """Discover fork/control pairs from record metadata instead of hard-coded ordinals.
 
     For every (prompt md5, output position) present in more than one forward,
-    the reference is the earliest forward whose input batch has one row; every
-    other record with that key is paired against it. A second bs=1 record with
-    the same key becomes a control pair (expected bit-identical); a bs>1 record
-    becomes a fork pair. Returns "orda:idxa>ordb:idxb" strings.
+    the reference is the earliest forward with the FEWEST admitted records
+    (the lone request; under padded buckets its input batch is still wide, so
+    batch width is not the criterion). Every other record with that key is
+    paired against it: same record count -> control (expected bit-identical),
+    more records -> fork. Returns "orda:idxa>ordb:idxb" strings.
     """
     by_key = {}
     for ordinal in sorted(data):
         p = data[ordinal]
         for index, r in enumerate(p["records"]):
-            by_key.setdefault((prompt_md5(r), r["output_position"]), []).append((ordinal, index, p["input_shape"][0]))
+            by_key.setdefault((prompt_md5(r), r["output_position"]), []).append(
+                (ordinal, index, p["input_shape"][0], len(p["records"])))
     pairs, kinds = [], []
     for key, entries in sorted(by_key.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-        ref = next((e for e in entries if e[2] == 1), None)
-        if ref is None or len(entries) < 2:
+        if len(entries) < 2:
             continue
+        ref = min(entries, key=lambda e: (e[3], e[0]))
         for e in entries:
             if e is ref:
                 continue
             pairs.append(f"{ref[0]}:{ref[1]}>{e[0]}:{e[1]}")
-            kinds.append(("control" if e[2] == 1 else f"fork(bs={e[2]})", key))
+            kinds.append(("control" if e[3] == ref[3] else f"fork(rows={e[3]},bs={e[2]})", key))
     return pairs, kinds
 
 

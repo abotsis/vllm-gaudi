@@ -123,9 +123,63 @@ def run_parity(args):
     return out
 
 
+def run_rowdep(args):
+    """Row/composition dependence under graph replay, no diagnostics needed.
+
+    identical: 8 copies of one prompt at once; every row must produce the same
+      text and match the serial run (a mismatch = the result depends on the row
+      index or on batch mates with identical content).
+    condense:  the prompt plus 7 short companions (max_tokens=3) that finish
+      early, forcing the input batch to condense while the prompt is mid-decode;
+      the prompt's text must still match serial.
+    """
+    out = {"mode": "rowdep", "max_tokens": args.max_tokens, "cases": {}}
+    for name in ("prose", "j_delta"):
+        prompt = {**PROMPTS, **DELTA_PROMPTS}[name]
+        case = {"serial": ask(args.base, args.model, prompt, args.max_tokens)["text"]}
+        barrier = threading.Barrier(8)
+
+        def same(_, barrier=barrier, prompt=prompt):
+            barrier.wait()
+            return ask(args.base, args.model, prompt, args.max_tokens)["text"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            texts = list(pool.map(same, range(8)))
+        case["identical_rows_distinct"] = len(set(texts))
+        case["identical_rows_match_serial"] = sum(t == case["serial"] for t in texts)
+        case["identical_first_divergence"] = [greedy.first_divergence(case["serial"], t) for t in texts]
+        barrier2 = threading.Barrier(8)
+        short = PROMPTS["factual"]
+
+        def mixed(i, barrier=barrier2, prompt=prompt, short=short):
+            barrier.wait()
+            if i == 0:
+                return ask(args.base, args.model, prompt, args.max_tokens)["text"]
+            return ask(args.base, args.model, short, 3)["text"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            texts = list(pool.map(mixed, range(8)))
+        case["condense_match_serial"] = texts[0] == case["serial"]
+        case["condense_first_divergence"] = greedy.first_divergence(case["serial"], texts[0])
+        out["cases"][name] = case
+        print(
+            f"{name:8s} identical-rows: distinct={case['identical_rows_distinct']} "
+            f"match_serial={case['identical_rows_match_serial']}/8 div={case['identical_first_divergence']}",
+            flush=True)
+        print(
+            f"{name:8s} condense: match_serial={case['condense_match_serial']} "
+            f"div={case['condense_first_divergence']}",
+            flush=True)
+    ok = all(c["identical_rows_distinct"] == 1 and c["identical_rows_match_serial"] == 8 and c["condense_match_serial"]
+             for c in out["cases"].values())
+    out["ok"] = ok
+    print("rowdep:", "OK" if ok else "DEPENDENCE FOUND", flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["capture", "parity"])
+    ap.add_argument("mode", choices=["capture", "parity", "rowdep"])
     ap.add_argument("--base", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default="glm-5.3-flash")
     ap.add_argument("--prompt", default="prose", choices=list(PROMPTS))
@@ -136,13 +190,15 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.max_tokens is None:
-        args.max_tokens = 3 if args.mode == "capture" else 256
-    out = run_capture(args) if args.mode == "capture" else run_parity(args)
+        args.max_tokens = {"capture": 3, "parity": 256, "rowdep": 128}[args.mode]
+    out = {"capture": run_capture, "parity": run_parity, "rowdep": run_rowdep}[args.mode](args)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=1)
     print(f"wrote {args.out}")
     if args.mode == "parity":
         return 0 if out["identical"] == out["total"] else 1
+    if args.mode == "rowdep":
+        return 0 if out["ok"] else 1
     return 0
 
 

@@ -31,7 +31,19 @@ def test_auto_pairs_reference_is_earliest_single_row_forward():
     }
     pairs, kinds = dc.auto_pairs(data)
     assert pairs == ["0:0>3:0", "1:0>5:0", "1:0>6:1"]
-    assert [k for k, _ in kinds] == ["control", "control", "fork(bs=2)"]
+    assert [k for k, _ in kinds] == ["control", "control", "fork(rows=2,bs=2)"]
+
+
+def test_auto_pairs_under_padded_buckets_uses_record_count():
+    # Every decode forward is padded to 8 rows; the lone request is still the reference.
+    data = {
+        1: payload(1, "decode", 8, [record("A", 1)], []),
+        5: payload(5, "decode", 8, [record("B", 1)], []),
+        6: payload(6, "decode", 8, [record("B", 2), record("C", 1)], []),
+    }
+    pairs, kinds = dc.auto_pairs(data)
+    assert pairs == ["1:0>5:0", "1:0>6:1"]
+    assert [k for k, _ in kinds] == ["control", "fork(rows=2,bs=8)"]
 
 
 def test_route_margin_and_flip_detection():
