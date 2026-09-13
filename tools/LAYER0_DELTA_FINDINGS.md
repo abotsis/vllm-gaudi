@@ -266,3 +266,42 @@ Branch `fix/glm53-kda-transition`, six commits over 7a44eab6:
 3. Logprob check: `probe_first_logits.py` pattern (logprobs=True, top_logprobs=5)
    on any boot; every entry must have a sorted top list whose first value equals
    the chosen token's logprob, no duplicate tokens, no -9999.
+
+## 9. HPU window 2026-09-13: shape is not the cause; graph replay is row-dependent
+
+All boots: TP=8, nospec, bf16 mHC, `--no-async-scheduling`, decode buckets
+pinned to one recipe `(8, 1, 32)`, prompt bs 1. Warmup takes ~2 min with a
+single decode bucket (vs 30-40 min on the full ladder); a boot is ready in ~10 min.
+
+| boot | knobs | result |
+|---|---|---|
+| parity #1 | defaults | serial vs concurrent 9/12 identical (code2, prose, j_delta diverge); every serving decode ran `('decode', 8, 1, 32)` per the fwd trace |
+| capture | LOGPROB_PROBE=1 | fork pairs A@dec1/dec2 (alone) vs B/C (co-batched): **bit-identical on all 199 boundaries**, layer-0 KDA interior included, 0 routing flips (lazy diag forward, graphs bypassed) |
+| parity #2 | VLLM_HPU_DECODE_TENSOR_CACHE=0, rowdep probe | rowdep: 8 identical `prose` copies at once -> **7 distinct texts**, 2/8 match serial (6 rows diverge at char 81, one at 138); 8 identical `j_delta` -> 5 distinct, 2/8 match; parity 8/12 with a *different* set of diverging prompts (prose2, struct, math) |
+
+Conclusions:
+1. The 09-11 layer-0 1-ULP delta was recipe shape (real bs 1 vs 2 in lazy
+   mode). With shapes pinned, co-batching is bit-exact in lazy mode.
+2. The serving-visible divergence is **graph-replay specific and row
+   dependent**: identical inputs in different rows of one replayed batch give
+   different outputs, and the set of affected prompts changes from boot to
+   boot. That is a nondeterminism/race signature, not numerics. The decode
+   tensor cache is not the cause.
+3. Suspects, in order: the launch-boundary policy of 7a44eab6 (no mark_step
+   before the TP all-reduce, no per-layer mark_step under replay; validated
+   only on a 2-rank single-stream bench), then anything else that reads a
+   producer's output inside the replayed graph without a dependency. Test:
+   `VLLM_HPU_ALLREDUCE_MARKSTEP=1 VLLM_CONFIG_HIDDEN_LAYERS=1` + rowdep.
+
+Logprobs: with the host-ownership fix in place the **first** logprobs request
+of a boot still returned the 09-11 garbling (token ids = every other id then
+zeros, values correct); all later requests, serial and concurrent, were clean
+(23/24). So it is a first-execution defect of the gather recipe, not a
+lifetime race. Commit 48770bd8 drops the int64->int32 narrowing of the ids in
+both HPU gather paths; the probe's top_logprobs sweep tells first-in-process
+from first-per-recipe.
+
+Tooling notes: `diag_compare --auto` now picks the reference by fewest
+admitted records (under padded buckets every forward is 8 wide);
+`diag_window_driver.py rowdep` is the replay row-dependence probe;
+`LOGPROB_PROBE=1` / `PRE_ARM_HOOK=` run on the live server before any capture.
