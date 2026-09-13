@@ -116,6 +116,19 @@ curl -s -m 600 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: ap
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Say OK."}],"max_tokens":2,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' >/dev/null
 sleep 3
 
+# Optional pre-arm probes on the live server (before any diagnostic sentinel exists,
+# so the one-shot capture budget is untouched). LOGPROB_PROBE=1 runs the first-token
+# logprob self-consistency probe; PRE_ARM_HOOK=<cmd> runs an arbitrary command.
+if [ "${LOGPROB_PROBE:-0}" = "1" ]; then
+  echo "--- logprob self-consistency probe ---"
+  "$PY" "$REPO/tools/diag_logprob_probe.py" --base "http://127.0.0.1:$PORT/v1" --reps 3 \
+    --out "$RUNDIR/diag_logprobs_${STAMP}.json" || echo "LOGPROB PROBE: inconsistencies found (see above)"
+fi
+if [ -n "${PRE_ARM_HOOK:-}" ]; then
+  echo "--- pre-arm hook: $PRE_ARM_HOOK ---"
+  bash -c "$PRE_ARM_HOOK" || echo "pre-arm hook rc=$?"
+fi
+
 case "$ROLE" in
   capture)
     echo "--- arming diagnostic sentinels (after readiness, identical on all ranks: single host) ---"
