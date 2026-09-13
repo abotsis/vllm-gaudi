@@ -9,6 +9,7 @@ from functools import partial, wraps
 import itertools
 import math
 import os
+import stat
 import time
 from contextlib import suppress
 from tqdm import tqdm
@@ -1317,6 +1318,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         clear_config()
         finalize_config()
         self.vllm_config = vllm_config
+        # State capture must be armed after boot/readiness, never by a stale sentinel.
+        diag_directory = os.environ.get("VLLM_DIAG_SAMPLER_DIR")
+        self._diag_state_disabled_at_boot = bool(diag_directory
+                                                 and os.path.lexists(os.path.join(diag_directory, "STATE_ENABLED")))
+        self._diag_layer_disabled_at_boot = bool(diag_directory
+                                                 and os.path.lexists(os.path.join(diag_directory, "LAYER_ENABLED")))
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -3873,7 +3880,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                lora_mask,
                                warmup_mode=False,
                                inputs_embeds=None,
-                               model_mm_kwargs=None):
+                               model_mm_kwargs=None,
+                               diag_state_context=None):
         # FORWARD.
         batch_size = token_ids.size(0)
         seq_len = self._seq_len(attn_metadata)
@@ -3898,6 +3906,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
+        if not warmup_mode and diag_state_context is not None:
+            self._diag_state_before(diag_state_context, token_ids, position_ids, trimmed_attn_metadata, logits_indices)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -3908,7 +3918,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             model_event_name = 'model_executable'
         if getattr(self, "_decode_tensor_cache", False) and use_graphs:
             os.environ["PT_HPUGRAPH_DISABLE_TENSOR_CACHE"] = "1" if attn_metadata.is_prompt else "0"
-        with self.profiler.record_event('internal', model_event_name):
+        layer_context = contextlib.nullcontext()
+        if not warmup_mode and diag_state_context is not None and htorch.utils.internal.is_lazy():
+            # Keep baseline use_graphs for conv writes and tensor-cache policy.
+            from vllm_gaudi.v1.worker.layer_diagnostic import collecting, directory, prepare
+            layer_directory = directory(self)
+            if layer_directory is not None:
+                ticket = prepare(self, layer_directory, diag_state_context, token_ids, position_ids,
+                                 trimmed_attn_metadata, logits_indices, htorch.core.mark_step,
+                                 get_tensor_model_parallel_rank(), use_graphs)
+                if ticket is not None:
+                    additional_kwargs["bypass_hpu_graphs"] = True
+                    layer_context = collecting(ticket)
+        with layer_context, self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
                                                attn_metadata=trimmed_attn_metadata,
@@ -4311,6 +4333,120 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return lora_mask, lora_logits_mask
 
+    # Temporary, removable sampler diagnostic; deliberately not a production env API.
+    # warmup_mode is reset in sample_tokens before this hook, so it is NOT a
+    # reliable warmup guard here. The operator MUST create DIR/ENABLED only after
+    # readiness, on the shared local filesystem, and never re-arm it during warmup.
+    # Keep the sentinel/config identical on all TP ranks for symmetric clone/mark.
+    def _diag_state_before(self, context, tokens, positions, metadata, logits_indices):
+        if not os.environ.get("VLLM_DIAG_SAMPLER_DIR"):
+            return
+        from vllm_gaudi.v1.worker.kda_state_diagnostic import capture, state_directory
+        directory = state_directory(self)
+        if directory is None:
+            return
+        try:
+            capture(self, directory, context, tokens, positions, metadata, logits_indices, htorch.core.mark_step,
+                    get_tensor_model_parallel_rank())
+        except Exception:
+            logger.warning("Incoming KDA state diagnostic failed", exc_info=True)
+
+    def _diag_sampler_directory(self):
+        directory = os.environ.get("VLLM_DIAG_SAMPLER_DIR")
+        if not directory:
+            return None
+        parallel = self.parallel_config
+        if (self.speculative_config is not None or self.use_async_scheduling or parallel.tensor_parallel_size != 8
+                or parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1
+                or getattr(self, "warmup_mode", True)):
+            return None
+        # Only a direct child of /tmp: no intermediate symlinks or arbitrary paths.
+        if os.path.dirname(directory) != "/tmp" or os.path.basename(directory) in ("", ".", ".."):
+            return None
+        try:
+            info = os.lstat(directory)
+            sentinel = os.lstat(os.path.join(directory, "ENABLED"))
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700
+                    or not stat.S_ISREG(sentinel.st_mode) or sentinel.st_uid != os.getuid()
+                    or stat.S_IMODE(sentinel.st_mode) != 0o600):
+                return None
+        except OSError:
+            return None
+        return directory
+
+    def _diag_sampler_before(self, logits, sampling_metadata, request_ids, logits_requests, pad_to):
+        directory = self._diag_sampler_directory()
+        if directory is None:
+            return None
+        ordinal = getattr(self, "_diag_sampler_calls", 0)
+        if ordinal >= 256:
+            return None
+        self._diag_sampler_calls = ordinal + 1
+        row_ids = logits_requests if logits_requests is not None else request_ids
+        if row_ids is None or not 0 < len(row_ids) <= 8 or logits.ndim != 2 or len(row_ids) > logits.shape[0]:
+            return None
+        count = len(row_ids)
+        raw_bytes = count * logits.shape[1] * logits.element_size()
+        used = getattr(self, "_diag_sampler_raw_bytes", 0)
+        if used + raw_bytes > 64 * 1024 * 1024:
+            return None
+        # Charge on every rank, including failed writes: I/O cannot change the
+        # subsequent all-rank tensor work or evade either bound.
+        self._diag_sampler_raw_bytes = used + raw_bytes
+        owned = logits[:count].detach().clone()
+        htorch.core.mark_step()
+        if get_tensor_model_parallel_rank() != 0:
+            return None
+        try:
+            # Blocking, independent CPU storage BEFORE sampler's in-place changes.
+            raw = owned.to(device="cpu", non_blocking=False, copy=True)
+            batch = self.input_batch
+            indices = [batch.req_id_to_index.get(req_id) for req_id in row_ids]
+            prompts = getattr(batch, "num_prompt_tokens", None)
+            return {
+                "directory": directory,
+                "ordinal": ordinal,
+                "raw_logits": raw,
+                "logits_shape": tuple(logits.shape),
+                "real_row_count": count,
+                "pad_to": pad_to,
+                "request_ids": deepcopy(request_ids),
+                "logits_requests": deepcopy(logits_requests),
+                "selected_row_request_ids": deepcopy(row_ids),
+                "input_batch_indices": indices,
+                "prompt_lengths": [int(prompts[i]) if prompts is not None and i is not None else None for i in indices],
+                # Preserve metadata order/padding and duplicates, NOT a guessed
+                # request-to-logit mapping. These lists may alias live histories.
+                "output_token_ids": deepcopy(sampling_metadata.output_token_ids),
+            }
+        except Exception:
+            logger.warning("Sampler diagnostic snapshot failed", exc_info=True)
+            return None
+
+    def _diag_sampler_after(self, capture, sampler_output):
+        if capture is None:
+            return
+        try:
+            capture["sampled_token_ids"] = sampler_output.sampled_token_ids.detach().to(device="cpu",
+                                                                                        non_blocking=False,
+                                                                                        copy=True)
+            directory = capture.pop("directory")
+            # Exclusive, no-follow creation through a verified directory fd.
+            # Never overwrite earlier runs; errors are diagnostic-only.
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(directory_fd)
+                if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                    return
+                name = f"sampler-{os.getpid()}-{capture['ordinal']:03d}.pt"
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+                with os.fdopen(fd, "wb") as stream:
+                    torch.save(capture, stream)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            logger.warning("Sampler diagnostic write failed", exc_info=True)
+
     def _run_sampling(self,
                       batch_changed: bool,
                       logits_device: torch.Tensor,
@@ -4319,8 +4455,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
         htorch.core.mark_step()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
+        capture = self._diag_sampler_before(logits_device, sampling_metadata, request_ids, logits_requests, pad_to)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         htorch.core.mark_step()
+        self._diag_sampler_after(capture, sampler_output)
         return sampler_output, sampling_metadata
 
     def _pool(
@@ -4800,7 +4938,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         lora_mask,
                         inputs_embeds=inputs_embeds,
                         model_mm_kwargs=model_mm_kwargs,
-                        warmup_mode=warmup_mode)
+                        warmup_mode=warmup_mode,
+                        diag_state_context=(req_id, logits_requests))
                 htorch.core.mark_step()
                 if mtp_prompt_batch is not None and not logits_requests:
                     self.drafter.prefill_cache_only(mtp_prompt_batch["token_ids"], position_ids,
@@ -4892,7 +5031,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.kv_caches,
                 lora_logits_mask,
                 lora_mask,
-                warmup_mode=warmup_mode)
+                warmup_mode=warmup_mode,
+                diag_state_context=(pd_info.decode_req_ids, pd_info.decode_req_ids))
             htorch.core.mark_step()
 
             if self.use_structured_output:

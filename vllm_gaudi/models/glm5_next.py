@@ -72,6 +72,10 @@ from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator, )
 
+from vllm_gaudi.v1.worker.layer_diagnostic import boundary as _diag_layer_boundary
+from vllm_gaudi.v1.worker.layer_diagnostic import attention_hooks as _diag_attention_hooks
+from vllm_gaudi.v1.worker.layer_diagnostic import (kda_boundary as _diag_kda, kda_sequence_boundary as _diag_kda_seq,
+                                                   kda_pool_rows as _diag_kda_pool)
 from vllm_gaudi.ops.causal_conv1d_pytorch import (
     hpu_causal_conv1d_fn,
     hpu_causal_conv1d_update,
@@ -530,6 +534,8 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
         mixed_qkv, _ = self.qkv_proj(x)
         g = self._forget_gate(x)  # [T, H, D] in (-lb, 0)
         beta = torch.sigmoid(self.b_proj(x)[0].float())  # [T, H]
+        _diag_kda(self, "forget_gate", g)
+        _diag_kda(self, "beta", beta)
         conv_w = self._conv_weight_local()
 
         H, D = self.num_heads, self.head_dim
@@ -560,6 +566,8 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
             ).transpose(0, 1)
             if padding_mask_flat is not None and padding_mask_flat.numel() == num_tokens:
                 qkv = qkv * token_mask
+            _diag_kda(self, "conv_out", qkv)
+            _diag_kda_seq(self, "ssm_state_in", initial_state)
 
             T = num_tokens
             q = qkv[:, :self.qkv_dim_local].view(1, T, H, D)
@@ -576,6 +584,7 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
 
             core_b, final_state = _glm_kda_chunk(q, k, v, gg, bb, init, self.mamba_chunk_size)
             core = core_b.reshape(T, H, D)
+            _diag_kda_seq(self, "ssm_state_out", final_state)
             _kda_save_state(final_state, ssm_state, store_indices, guard_padding=prefill_num_seqs > 1)
 
         elif conv_state is not None:
@@ -603,6 +612,7 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
                 )
             else:
                 conv_slots = _kda_conv_slots(state_indices, num_decodes) if state_indices is not None else None
+                _diag_kda_pool(self, "conv_pool_in", conv_state, conv_slots)
                 qkv = hpu_causal_conv1d_update(
                     x=mixed_qkv,
                     conv_state=conv_state,
@@ -612,6 +622,8 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
                     conv_state_indices=conv_slots,
                     query_start_loc=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
                 )
+                _diag_kda_pool(self, "conv_pool_out", conv_state, conv_slots)
+            _diag_kda(self, "conv_out", qkv)
             T = num_tokens
             q = qkv[:, :self.qkv_dim_local].view(T, H, D)
             k = qkv[:, self.qkv_dim_local:2 * self.qkv_dim_local].view(T, H, D)
@@ -645,9 +657,13 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
                 states = ssm_state.index_select(
                     0,
                     torch.remainder(_kda_load_slots(state_indices, num_accepted_tokens, n), ssm_state.shape[0]).long())
+                # kda_decode_step updates `states` in place; the snapshot below is
+                # ordered before it in the lazy graph, so it holds the loaded state.
+                _diag_kda(self, "ssm_state_in", states)
                 out_n, states_new = kda_decode_step(states, q[:n], k[:n], v[:n],
                                                     g.view(T, H, D)[:n],
                                                     beta.view(T, H)[:n])
+                _diag_kda(self, "kda_out", out_n)
                 # Padded decode lanes carry the sentinel -1, and the
                 # remainder() above wraps -1 onto the LAST REAL slot (N-1) --
                 # so an unguarded write-back clobbers whichever live sequence
@@ -661,6 +677,7 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
                 _store = _kda_store_slots(store_indices, n)
                 pad = (_store < 0).view(-1, *([1] * (states_new.dim() - 1)))
                 states_new = torch.where(pad, states, states_new.to(states.dtype))
+                _diag_kda(self, "ssm_state_out", states_new)
                 _kda_save_state(states_new, ssm_state, _store)
                 core[:n] = out_n.to(core.dtype)
             # This tail exists for a MIXED batch, where rows past the decode
@@ -677,7 +694,9 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
                                           beta.view(T, H)[num_decodes:].unsqueeze(0), None, max(1, T - num_decodes))
                 core[num_decodes:] = extra.squeeze(0).to(core.dtype)
 
+        _diag_kda(self, "core", core)
         gate = self.g_b_proj(self.g_a_proj(x)[0])[0].view(-1, H, D)
+        _diag_kda(self, "gate", gate)
         out = self._gated_o_norm(core, gate).view(num_tokens, -1)
         out, _ = self.o_proj(out)
         return out.view(orig_shape)
@@ -1026,6 +1045,7 @@ class HpuGlm5NextDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         layer_idx = extract_layer_index(prefix)
+        self._diag_split_layer0 = layer_idx == 0
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = HpuGlm5NextMoE(config, vllm_config, prefix=f"{prefix}.mlp")
         else:
@@ -1034,17 +1054,29 @@ class HpuGlm5NextDecoderLayer(nn.Module):
     def forward(self, positions, hidden_streams):
         # hidden_streams: [T, hc, hidden]
         post_a, comb_a, x = self.attn_hc(hidden_streams)
+        if self._diag_split_layer0:
+            # All three outputs are token-leading: [T, hc, 1], [T, hc, hc], [T, hidden].
+            _diag_layer_boundary(self._prefix + ".attention_mhc_pre_input", x)
+            _diag_layer_boundary(self._prefix + ".attention_mhc_pre_post_a", post_a)
+            _diag_layer_boundary(self._prefix + ".attention_mhc_pre_comb_a", comb_a)
         x = self.input_layernorm(x)
-        if self._is_linear:
-            attn_out = self.self_attn(hidden_states=x)
-        else:
-            attn_out = self.self_attn(positions=positions, hidden_states=x)
+        if self._diag_split_layer0:
+            _diag_layer_boundary(self._prefix + ".attention_norm_input", x)
+        with _diag_attention_hooks(self):
+            if self._is_linear:
+                attn_out = self.self_attn(hidden_states=x)
+            else:
+                attn_out = self.self_attn(positions=positions, hidden_states=x)
+        if self._diag_split_layer0:
+            _diag_layer_boundary(self._prefix + ".attention_raw_output", attn_out)
         residual = _mhc_post(attn_out, hidden_streams, post_a, comb_a)
+        _diag_layer_boundary(self._prefix + ".attention_mhc_post", residual)
 
         post_f, comb_f, x = self.ffn_hc(residual)
         x = self.post_attention_layernorm(x)
         ffn_out = self.mlp(x)
         residual = _mhc_post(ffn_out, residual, post_f, comb_f)
+        _diag_layer_boundary(self._prefix + ".ffn_mhc_post", residual)
         return residual
 
 
@@ -1102,6 +1134,7 @@ class HpuGlm5NextModel(nn.Module):
         # mHC streams init: replicate embed across hc streams, then final
         # unweighted-mean collapse (Glm5NextTextHyperHead) before the norm
         streams = hidden.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+        _diag_layer_boundary("initial_streams", streams)
         for layer in self.layers[self.start_layer:self.end_layer]:
             streams = layer(positions=positions, hidden_streams=streams)
         hidden = streams.mean(dim=1)
@@ -1112,6 +1145,7 @@ class HpuGlm5NextModel(nn.Module):
         # simple layout stays: norm here, both consumers get the post-norm
         # hidden state.
         hidden = self.norm(hidden)
+        _diag_layer_boundary("final_norm", hidden)
         return hidden
 
 

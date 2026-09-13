@@ -15,6 +15,7 @@ from vllm_gaudi.extension.utils import (FP8Matmul, Matmul, B2BMatmul, ModuleFuse
 from vllm_gaudi.attention.backends.hpu_attn import HPUMLAMetadata
 import vllm_gaudi.extension.kernels as kernels
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm_gaudi.v1.worker.layer_diagnostic import attention_boundary, attention_metadata
 
 
 class _DummyPrefillBackend:
@@ -141,6 +142,10 @@ class HPUMLAAttention(MLAAttention):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         is_prefill = attn_metadata.is_prompt
+        attention_metadata(self.impl, attn_metadata)
+        attention_boundary(self.impl, "q", q)
+        attention_boundary(self.impl, "kv_c_normed", k_c_normed)
+        attention_boundary(self.impl, "k_pe", k_pe)
 
         if not is_prefill:
             # decode
@@ -157,6 +162,7 @@ class HPUMLAAttention(MLAAttention):
             decode_ql_nope = torch.bmm(q_nope, self.W_UK_T)
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
+            attention_boundary(self.impl, "decode_q_absorbed", decode_ql_nope)
 
         slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
 
@@ -168,6 +174,7 @@ class HPUMLAAttention(MLAAttention):
             latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
             latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
 
+        attention_boundary(self.impl, "latent_cache_write_input", latent_vec_k)
         # write the latent and rope to kv cache
         if kv_cache is not None and len(kv_cache) >= 2:
             # Always use impl-owned cache op so INC quantization maps to one canonical module path.
@@ -178,7 +185,9 @@ class HPUMLAAttention(MLAAttention):
             return output
         else:
             output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata)
+            attention_boundary(self.impl, "decode_attention_latent", output)
             output = self._v_up_proj(output)
+            attention_boundary(self.impl, "decode_v_up_proj", output)
             return output
             # NOTE(Xinyu): Make the loaded weight contiguous to avoid the transpose
 

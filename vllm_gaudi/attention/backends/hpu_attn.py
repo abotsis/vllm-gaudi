@@ -27,6 +27,7 @@ from vllm_gaudi.extension.logger import logger as init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.v1.attention.backends.registry import (register_backend, AttentionBackendEnum)
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm_gaudi.v1.worker.layer_diagnostic import attention_boundary
 
 logger = init_logger()
 
@@ -291,6 +292,9 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+        attention_boundary(self, "prefill_q", q)
+        attention_boundary(self, "prefill_k", k)
+        attention_boundary(self, "prefill_v", v)
 
         if not self.use_merged_prefill:
             assert attn_metadata.seq_lens_tensor is not None, \
@@ -340,6 +344,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         # NoPE: zero-width cat breaks compiled recipes; contiguous because
         # downstream batch2block .view()s it.
         query = (torch.cat([q_nope, q_pe], dim=-1) if q_pe is not None and q_pe.shape[-1] > 0 else q_nope.contiguous())
+        attention_boundary(self, "decode_query", query)
         key_cache = k_cache.unsqueeze(1) if k_cache is not None else None
         value_cache = None
         output = HPUPagedAttention.forward_decode(query=query,
