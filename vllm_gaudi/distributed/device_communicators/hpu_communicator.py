@@ -19,6 +19,30 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata
 # workaround that cost a graph boundary per collective.
 _ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "0") == "1"
 
+# VLLM_HPU_ALLREDUCE_MODE selects how the TP/EP all-reduce sums partials:
+#   hccl       (default) dist.all_reduce in the tensor's dtype.
+#   fp32       upcast, dist.all_reduce, downcast: fewer order-dependent roundings.
+#   gather_sum all_gather the partials and sum them on every rank in rank order
+#              in fp32: the result is independent of which rank owned which
+#              chunk of the buffer, i.e. identical rows of a batch stay
+#              identical (a reduce-scatter based all-reduce sums each chunk, one
+#              decode row each at [8, hidden], in a different rank order).
+_ALLREDUCE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "hccl").strip().lower()
+if _ALLREDUCE_MODE not in ("hccl", "fp32", "gather_sum"):
+    raise ValueError(f"VLLM_HPU_ALLREDUCE_MODE must be hccl, fp32 or gather_sum, got {_ALLREDUCE_MODE!r}")
+
+
+def sum_in_rank_order(gathered: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Sum [world, ...] partials in index order with fp32 accumulation, then cast.
+
+    Pure function of the gathered tensor: every rank computes the same bits,
+    and a row's result does not depend on its position in the buffer.
+    """
+    acc = gathered[0].float().clone()
+    for rank in range(1, gathered.shape[0]):
+        acc += gathered[rank].float()
+    return acc.to(dtype)
+
 
 class HpuCommunicator(DeviceCommunicatorBase):
 
@@ -60,6 +84,17 @@ class HpuCommunicator(DeviceCommunicatorBase):
         # the graph. VLLM_HPU_ALLREDUCE_MARKSTEP=1 restores the old behaviour.
         if _ALLREDUCE_MARKSTEP:
             htorch.core.mark_step()
+        if _ALLREDUCE_MODE == "gather_sum":
+            flat = input_.contiguous()
+            gathered = torch.empty((self.world_size, ) + tuple(flat.shape), dtype=flat.dtype, device=flat.device)
+            dist.all_gather_into_tensor(gathered, flat, group=self.device_group)
+            input_.copy_(sum_in_rank_order(gathered, input_.dtype))
+            return input_
+        if _ALLREDUCE_MODE == "fp32":
+            upcast = input_.float()
+            dist.all_reduce(upcast, group=self.device_group)
+            input_.copy_(upcast.to(input_.dtype))
+            return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
