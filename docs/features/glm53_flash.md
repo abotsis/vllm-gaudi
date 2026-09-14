@@ -153,13 +153,18 @@ the same request served alone. They were separated on 2026-09-13 with
    `VLLM_HPU_ALLREDUCE_LARGE_MODE=transpose` (hidden-major all-reduce, 2x
    working memory) is the untested candidate for having both.
 
-MTP note: with the all-reduce fixed, the draft's own self-attention
-(`VLLM_GLM_MTP_DRAFT_ATTN=1`) raises mean accepted length from 2.41 to 3.43
-(per-position 0.91/0.71/0.48/0.32). It currently forces the eager draft
-(12.9 tok/s single-stream vs 17.3 bypassed); with `VLLM_GLM_MTP_SPLIT_GRAPH=1`
-it reaches 22.1 tok/s aggregate (best measured) at 16.2 single-stream but
-showed one late serial-vs-concurrent divergence in 12 prompts, so the bypass
-stays the default until the draft attention is graph-safe.
+MTP note (2026-09-14): the draft's own self-attention is on by default and
+runs inside one HPU graph per draft step (`VLLM_GLM_MTP_DRAFT_ATTN=1`,
+`VLLM_GLM_MTP_ATTN_GRAPH=1`, both default). The attention metadata tensors
+are graph inputs and are swapped onto the forward context inside the
+captured forward, so replays read fresh block tables. Measured on the
+launcher at MTP-4: mean accepted length 3.33 (bypass 2.41), aggregate
+26.0 tok/s (bypass 20.2), single-stream 20.9 tok/s (bypass 17.3), greedy
+identical to the eager/split attention paths, serial-vs-concurrent parity
+12/12. The earlier bypass verdict dated from the all-reduce row corruption.
+`VLLM_GLM_MTP_DRAFT_ATTN=0` restores the bypass; `VLLM_GLM_MTP_ATTN_GRAPH=0`
+the split/eager paths. The draft graph captures at serving time per decode
+shape (warmup skips the draft), so the first request per shape compiles.
 
 Tools: `tools/diag_window_driver.py rowdep` (identical prompts must give
 identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.

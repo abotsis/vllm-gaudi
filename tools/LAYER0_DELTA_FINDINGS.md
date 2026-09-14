@@ -789,3 +789,17 @@ target graph), the light weights are private copies as in the other cores,
 and the layer-45 KV cache is the persistent buffer read/written in place.
 Replaces the split path's two replays + eager attention + four
 synchronizes with one replay. Gated in run `launcher_mtp4_attngraph`.
+
+Result (run `launcher_mtp4_attngraph3`, after two false starts: the runner
+hands the draft a trimmed namedtuple, not the dataclass, and no vLLM config
+context exists at serving time, so the metadata is swapped onto the active
+forward context instead of opening a new one):
+
+| mode | accepted len | aggregate tok/s | single-stream tok/s | greedy | parity |
+|---|---|---|---|---|---|
+| bypass (old default) | 2.41 | 20.16 | 17.3 | ref | 12/12 |
+| attention on, split graph | 3.33 | 20.29 | 16.7 | 5/8 vs bypass | 12/12 |
+| **attention on, attention graph** | 3.33 | **26.04** | **20.9** | 8/8 vs split | 12/12 |
+
+Now the plugin and launcher default (commit cbe0efa0). Confirmation boot on
+the plain launcher: run `launcher_mtp4_v3`.
