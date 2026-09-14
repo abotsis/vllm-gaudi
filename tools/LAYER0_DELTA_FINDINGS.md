@@ -475,3 +475,19 @@ is the eager draft (the +46% graphed-draft win is lost). Next boot:
 `VLLM_GLM_MTP_SPLIT_GRAPH=1` (captures the tensor work around the eager
 attention). If that recovers the graphed-draft speed, attention on becomes
 the default; otherwise the draft KV wiring needs to be made graph-safe.
+
+### 15b. Draft attention + split draft graph (`VLLM_GLM_MTP_SPLIT_GRAPH=1`, 19:24)
+
+| mode | accepted len | aggregate tok/s | single-stream tok/s | parity |
+|---|---|---|---|---|
+| A: bypass (shipped default) | 2.405 | 20.16 | 17.26 | 12/12 |
+| B: attention on, eager draft | 3.429 | 18.15 | 12.90 | 12/12 |
+| C: attention on, split graph | 3.429 | **22.10** | 16.16 | **11/12** (j_delta @337) |
+
+C is the fastest under concurrency and identical to B in what the draft
+computes, but its split path (captured pre/post cores around eager attention,
+four synchronizes per draft step) produced one late serial-vs-concurrent
+divergence that A and B never did in four boots. Not made default. Rerun to
+tell deterministic from racy; the real fix is a graph-safe draft attention
+(draft KV slot wiring), which would combine A's boundaries with B's
+acceptance and is the top MTP performance item.
