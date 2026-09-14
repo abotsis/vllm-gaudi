@@ -29,15 +29,24 @@ def profile_once(fn):
 
     import habana_frameworks.torch.core as htcore
     for _ in range(2):
-        fn()
+        r = fn()
         htcore.mark_step()
+        for t in (r if isinstance(r, (tuple, list)) else (r, )):
+            if isinstance(t, torch.Tensor):
+                t.float().sum().item()
         torch.hpu.synchronize()
     t0 = time.perf_counter()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU],
                                 with_stack=False,
                                 record_shapes=False) as prof:
-        fn()
+        result = fn()
         htcore.mark_step()
+        # Custom ops (FusedSDPA, fused MoE) defer execution until an output is
+        # read; consume the result inside the profiler window.
+        outs = result if isinstance(result, (tuple, list)) else (result, )
+        for t in outs:
+            if isinstance(t, torch.Tensor):
+                t.float().sum().item()
         torch.hpu.synchronize()
     wall = time.perf_counter() - t0
     path = tempfile.mktemp(suffix=".json")
