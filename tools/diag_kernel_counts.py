@@ -100,6 +100,33 @@ def main():
                 kda._KDA_SCAN_PARALLEL = case == "kda_parallel"
                 out = profile_once(lambda q=q, k=k, v=v, g=g, beta=beta: kda.hpu_chunk_kda(q, k, v, g, beta))
                 report(f"T={T} {case}", *out)
+            elif case == "mla_attn":
+                # MLA prefill attention as forward_mha issues it: [bs=1, T, H, 256] bf16, causal,
+                # valid_seq_lengths=[T], FusedSDPA through the plugin wrapper.
+                from vllm_gaudi.extension import kernels as kern
+                from vllm_gaudi.extension import ops as ext_ops
+                from vllm_gaudi.extension.utils import ModuleFusedSDPA
+                fsdpa = ModuleFusedSDPA(kern.fsdpa())
+                Ha, Dh = 8, 256
+                qa, ka, va = (torch.randn(1, T, Ha, Dh, generator=g_).to(torch.bfloat16).to(dev) for _ in range(3))
+                lengths = torch.tensor([T], dtype=torch.int32, device=dev)
+                out = profile_once(lambda qa=qa, ka=ka, va=va, lengths=lengths, fsdpa=fsdpa, Dh=Dh: ext_ops.
+                                   prompt_attention(impl="fsdpa_impl",
+                                                    query=qa,
+                                                    key=ka,
+                                                    value=va,
+                                                    is_causal=True,
+                                                    attn_bias=None,
+                                                    position_bias=None,
+                                                    valid_seq_lengths=lengths,
+                                                    scale=Dh**-0.5,
+                                                    matmul_qk_op=None,
+                                                    softmax_op=None,
+                                                    matmul_av_op=None,
+                                                    keys_fetch_func=None,
+                                                    values_fetch_func=None,
+                                                    fsdpa_op=fsdpa))
+                report(f"T={T} mla_attn (one layer; 11 MLA layers per forward)", *out)
             elif case == "mhc_pre":
                 f = mhc_pre_fn()
                 hc, hidden = 4, 4096
