@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from vllm.v1.sample import rejection_sampler
+import os
+
 import habana_frameworks.torch.core as htcore
 import torch
 from typing import Optional
@@ -288,6 +290,88 @@ def _apply_constraints_cpu(logits_cpu, cu_cpu, sampling_metadata, num_tokens):
     return logits_cpu.masked_fill(drop, float("-inf"))
 
 
+# VLLM_HPU_REJECTION_HOST=1 restores the host-side random path (temperature/
+# top-k/top-p/softmax/recovery on CPU). Default: the device path below.
+_REJECTION_HOST = os.environ.get("VLLM_HPU_REJECTION_HOST", "0") == "1"
+
+
+def _random_path_device(target_logits, draft_token_ids, cu_num_draft_tokens, num_draft_tokens, sampling_metadata,
+                        uniform, n_real):
+    """Non-greedy rejection sampling math on the device, materialised.
+
+    Returns host tensors over the n_real real token rows: accept mask, recovered
+    ids (int32), and the target argmax (int64). Everything runs in one lazy
+    segment bracketed by mark_step()s, on a private fp32 copy of the logits (no
+    in-place op touches the sampler's tensor), and the results are read only
+    after torch.hpu.synchronize(). Top-k/top-p are applied as per-row logit
+    thresholds derived from one descending sort (no scatter), so nothing here
+    is a fused consumer of the RNG or of another graph's storage -- the two
+    patterns that mis-executed under lazy mode and pushed this work to the host.
+    Upstream semantics: temperature, then top-k, then top-p on the k-filtered
+    distribution, softmax, accept iff p(draft) >= u, gumbel-max recovery with
+    the draft token zeroed and one exponential draw per request.
+    """
+    device = target_logits.device
+    batch_size = len(num_draft_tokens)
+    vocab = target_logits.shape[-1]
+    htcore.mark_step()
+    logits = target_logits[:n_real].to(torch.float32).clone()
+    argmax_dev = logits.argmax(dim=-1)
+    rows = _token_to_request_rows(n_real, cu_num_draft_tokens).clamp(max=batch_size - 1)
+    temp = sampling_metadata.temperature
+    if temp is not None:
+        t = temp.to(device=device, dtype=torch.float32).index_select(0, rows)
+        t = torch.where(t <= 0, torch.ones_like(t), t)  # -1.0 is the engine's greedy sentinel
+        logits = logits / t.unsqueeze(-1)
+    k = None
+    if sampling_metadata.top_k is not None:
+        k_cpu = sampling_metadata.top_k.cpu().long()
+        if bool(((k_cpu > 0) & (k_cpu < vocab)).any()):
+            k = torch.where(k_cpu <= 0, torch.full_like(k_cpu, vocab), k_cpu).clamp(max=vocab)
+            k = k.to(device).index_select(0, rows)
+    pv = None
+    if sampling_metadata.top_p is not None:
+        p_cpu = sampling_metadata.top_p.cpu().float()
+        if bool((p_cpu < 1.0).any()):
+            pv = p_cpu.to(device).index_select(0, rows).view(-1, 1)
+    if k is not None or pv is not None:
+        sorted_logits = torch.sort(logits, dim=-1, descending=True).values
+        n_keep = torch.full((n_real, ), vocab, dtype=torch.int64, device=device)
+        if k is not None:
+            n_keep = torch.minimum(n_keep, k)
+        if pv is not None:
+            positions = torch.arange(vocab, device=device).view(1, -1)
+            kept = sorted_logits.masked_fill(positions >= n_keep.view(-1, 1), float("-inf"))
+            probs_sorted = torch.softmax(kept, dim=-1)
+            cum = probs_sorted.cumsum(dim=-1)
+            # keep tokens while the cumulative mass BEFORE them is < top_p
+            n_keep = torch.minimum(n_keep, ((cum - probs_sorted) < pv).sum(dim=-1).clamp(min=1))
+        cutoff = sorted_logits.gather(-1, (n_keep - 1).view(-1, 1))
+        logits = logits.masked_fill(logits < cutoff, float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    drafts = draft_token_ids[:n_real].to(torch.int64)
+    drafts_idx = drafts.clamp(min=0).view(-1, 1)
+    p_draft = probs.gather(-1, drafts_idx).squeeze(-1)
+    accept = (p_draft >= uniform[:n_real].to(torch.float32)) & (drafts >= 0)
+    # recovery: one exponential draw per request (seeded generators live on
+    # the device), draft token zeroed by a broadcast compare (no scatter)
+    rows_q = []
+    for i in range(batch_size):
+        generator = sampling_metadata.generators.get(i)
+        row = torch.zeros(vocab, dtype=torch.float32, device=device)
+        if generator is not None and num_draft_tokens[i] > 0:
+            row.exponential_(generator=generator)
+        else:
+            row.exponential_()
+        rows_q.append(row)
+    inv_q = torch.stack(rows_q).reciprocal().index_select(0, rows)
+    is_draft = torch.arange(vocab, device=device).view(1, -1) == drafts_idx
+    recovered = (probs.masked_fill(is_draft, 0.0) * inv_q).argmax(dim=-1)
+    htcore.mark_step()
+    torch.hpu.synchronize()
+    return accept.cpu(), recovered.cpu().to(torch.int32), argmax_dev.cpu()
+
+
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -368,6 +452,20 @@ def rejection_sample(
     n_real = min(int(cu_cpu0[-1].item()), num_tokens) if len(cu_cpu0) else 0
     if n_real == 0:
         return greedy_out.to(device)
+    if not _REJECTION_HOST:
+        accept_real, recovered_real, argmax_real = _random_path_device(target_logits, draft_token_ids,
+                                                                        cu_num_draft_tokens, num_draft_tokens,
+                                                                        sampling_metadata, uniform, n_real)
+        host_argmax = torch.zeros(num_tokens, dtype=torch.int64)
+        host_argmax[:n_real] = argmax_real
+        greedy_out = rejection_sample_pytorch(draft_token_ids, host_argmax, bonus_token_ids, num_draft_tokens,
+                                              cu_num_draft_tokens)
+        accept_cpu = torch.zeros(num_tokens, dtype=torch.bool)
+        accept_cpu[:n_real] = accept_real
+        recovered_cpu = torch.zeros(num_tokens, dtype=torch.int32)
+        recovered_cpu[:n_real] = recovered_real
+        return _assemble(draft_token_ids, bonus_token_ids, cu_num_draft_tokens, sampling_metadata, batch_size,
+                         accept_cpu, recovered_cpu, greedy_out, device)
     raw_logits_cpu = target_logits[:n_real].cpu().float()
     # Recompute the greedy sub-result from the HOST copy of the logits. In a
     # mixed batch the bonus sampler's random path (gumbel + generators) fuses
@@ -399,6 +497,13 @@ def rejection_sample(
     # ---- host assembly, same masking scheme as the greedy helper ----
     recovered_cpu = torch.zeros(num_tokens, dtype=torch.int32)
     recovered_cpu[:n_real] = recovered_real.cpu()
+    return _assemble(draft_token_ids, bonus_token_ids, cu_num_draft_tokens, sampling_metadata, batch_size,
+                     accept_cpu, recovered_cpu, greedy_out, device)
+
+
+def _assemble(draft_token_ids, bonus_token_ids, cu_num_draft_tokens, sampling_metadata, batch_size, accept_cpu,
+              recovered_cpu, greedy_out, device):
+    """Host assembly of the output rows from per-token accept bits."""
     draft_cpu = draft_token_ids.cpu().to(torch.int32)
     bonus_cpu = bonus_token_ids.cpu().to(torch.int32).view(-1)
     cu_cpu = cu_num_draft_tokens.cpu()
