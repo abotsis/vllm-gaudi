@@ -613,3 +613,50 @@ rows on both prompts and both condense cases, serial-vs-concurrent parity
 launcher capture 5/8 with divergences only at the known near-tie characters:
 the contraction order changed at the fp32-rounding level (the oracle bounds
 it at ~1e-6), which is the batch-shape class, not a defect.
+
+## 20. Prefill at 3099 tokens: where the step goes (2026-09-14 09:36-10:30)
+
+Two boots after the decay-dot fix. (a) Rank-0 torch profiler on the
+3099-token step (VLLM_PROFILE_MIN_TOKENS=900 so the probe's calibration
+prefills no longer consume the window; run `prefill_prof3200b`). (b) The
+plugin's high-level profiler (VLLM_PROFILER_ENABLED=true, run
+`prefill_hlp`; its TTFT sweep matched §19 to the ms, so it is free).
+
+- **Forward wall = TTFT.** High-level profiler: `model_forward_bs1_seq3200`
+  437 ms per 3099-token step, prepare_input_tensors 4.5 ms, sampler 2 ms;
+  TTFT 487 ms. Nothing outside the forward matters.
+- **Device kernels cover 200 ms of those 437.** The torch trace shows
+  1.66 M kernel events in a 200 ms window (kernel union 127 ms, hpu_op
+  union 200 ms), 194 `ExecuteCachedGraph` launches (host, 149 ms summed,
+  one every ~4.4 ms) and 155 k `DmaMemcpy` events (179 ms summed). The
+  step is a chain of per-layer HPU graphs; the host launches and the
+  device kernels are each ~50% of the wall and only partly overlap.
+- **Per layer: ~40 k kernels in 4.5 ms.** Segmenting the kernel stream on
+  the MoE router bursts (`router_stage3_hf8`, 24 per layer, 42 bursts =
+  42 MoE layers = one step): KDA layers 4.4-4.5 ms span / 3.0 ms kernel
+  union / 40 k kernels; MLA layers 3.9 ms / 2.4 ms / 27.6 k kernels. Mean
+  kernel 1.2 us: the layer is kernel-count bound, not FLOP bound. GEMM is
+  0.75 ms union per layer.
+- **What the 40 k are.** Present identically in KDA and MLA layers (so not
+  attention): `reduce_sum_fwd_f32` 5312, `div_f32` 4622, `repeat_f32`
+  2736, `add_fwd_f32` 1424, plus the MoE fused op's own ~6 k
+  (`fused_kernel_0x4963EB1E`/`0x31260226`/`0x683B3E` 2088/2088/2030,
+  `generate_bitonic_chunks` 191, `weighted_sum_reduction` 24, GEMM 620).
+  KDA-only: `mult_fwd_f32` +3300, `sub_fwd_f32` 2856, `add_fwd_f32` +3400,
+  `BatchGemm` 960, `fused_kernel_0xD3FC0AB3_161/16C` 72+72 (the two
+  largest by summed time, 4 ms each), `cast_bf16_to_f32` +74.
+- **The reduce/div/repeat block is the mHC Sinkhorn.** Microbench
+  (`diag_kernel_counts.py --cases mhc_pre --tokens 3200`): one mHC pre
+  call = 8541 kernels (reduce_sum 2791, div 2713, repeat 1368, add 831),
+  0.7 ms device union; two calls per layer = 1.4 ms of the layer's 3.0 ms
+  kernel union. The [T, 4, 4] comb tensor reduces over its 4-wide fastest
+  dim and every one of the ~120 tiny ops (20 iterations x row/col
+  normalise) is split into ~67 kernels of ~48 rows.
+
+Sinkhorn layouts tried (all bit-identical on CPU; `VLLM_GLM_MHC_SINKHORN`):
+
+| layout | kernels/call | union ms | note |
+|---|---|---|---|
+| tj (shipped) | 8541 | 0.7 | reduce over fastest dim |
+| tm ([4,4,T], strided reduces) | - | - | graph compile did not finish in 12 min; dropped |
+| mm ([T,16] x [16,4] selector GEMMs) | 4597 | 0.4 | reduce_sum gone; div still 67/op (GEMM output sliced) ; max diff 1.8e-7 vs tj |
