@@ -4,6 +4,7 @@ import contextlib
 import gc
 import math
 import os
+import time
 import queue
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -582,7 +583,12 @@ class HPUWorker(WorkerBase):
         )
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        if not self.step_debug:
+            return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        t0 = time.perf_counter()
+        out = self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        self.step_debug(f'step={self.step - 1} sample_tokens_ms={(time.perf_counter() - t0) * 1000:.1f}')
+        return out
 
     @torch.inference_mode()
     def execute_model(
@@ -597,10 +603,17 @@ class HPUWorker(WorkerBase):
             logger.info("step profiler start: engine step %d, profile step %d, %s scheduled tokens", self.step,
                         self.profile_step, getattr(scheduler_output, "total_num_scheduled_tokens", "?"))
             self.step_profiler.start()
+        t_exec = time.perf_counter()
         with track_graph_compile('HPUWorker.execute_model') \
                 if self.gc_track_recompiles \
                 else contextlib.nullcontext():
             output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
+        if self.step_debug:
+            # VLLM_DEBUG=steps: host wall of execute_model per engine step with
+            # the scheduled token count (prefill TTFT attribution without a
+            # profiler; sample_tokens is timed separately below).
+            self.step_debug(f'step={self.step} tokens={getattr(scheduler_output, "total_num_scheduled_tokens", "?")} '
+                            f'execute_model_ms={(time.perf_counter() - t_exec) * 1000:.1f}')
         # TODO(woosuk): Send the output to the engine process.
         if counts_for_profile:
             if self.profile_step >= self.profile_steps[0]:
