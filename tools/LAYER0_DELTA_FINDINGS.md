@@ -729,3 +729,30 @@ halves the KDA kernel count at 50 chunks: measured on the launcher in run
 `prefill_kdapar` (below). The standalone fused-MoE case cannot register
 weights outside the real loader ("MOE multiplexer weights were partially
 registered") and was dropped.
+
+### 20.3 Parallel KDA prefix scan on the launcher (11:23) -> launcher default
+
+Run `prefill_kdapar` (`VLLM_KDA_SCAN=parallel`, otherwise the shipped recipe):
+
+| prompt tokens | TTFT seq (s) | TTFT parallel (s) |
+|---|---|---|
+| 123 | 0.126 | 0.112 |
+| 507 | 0.169 | 0.170 |
+| 1003 | 0.219 | 0.222 |
+| 1995 | 0.324 | 0.330 |
+| 2059 | 0.55-0.63 | 0.466 |
+| 3099 | 0.487 | 0.451 |
+
+7% at the 3200 bucket (6879 tok/s), neutral at and below 2048. Gates:
+greedy 8/8 identical to the sequential boot, rowdep 8/8, parity 12/12,
+decode 13.7 tok/s. `glm53_serve.sh` now exports VLLM_KDA_SCAN=parallel
+(KDA_SCAN=seq restores the loop); the plugin default stays seq. The
+1-2 ms jitter at 123 tokens is restart variance.
+
+Where prefill stands after §17-§20: TTFT 0.125/0.17/0.22/0.33/0.45 s at
+123/507/1003/1995/3099 tokens (from 0.139/0.249/0.377/1.046/0.915). The
+remaining time is an ~80 ms per-step floor of per-layer graph launches
+plus ~0.1 ms/token of compiler-sliced small kernels; neither moves with
+op-level PyTorch rewrites (mm Sinkhorn, KDA chunk length: no change).
+Next lever is structural (fewer graphs per step, VLLM_CONFIG_HIDDEN_LAYERS,
+run `prefill_hl2`), then a fused TPC path if the floor must go lower.

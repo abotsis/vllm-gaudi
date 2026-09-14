@@ -175,6 +175,13 @@ identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.
   mHC mixing are minor at every bucket. Prompt-query buckets are
   128/256/512/1024/2048/3200: a prompt just over an edge pays the next
   bucket (30-50% TTFT), so size `VLLM_PROMPT_QUERY_BUCKET_*` to the workload.
+- `VLLM_KDA_SCAN=parallel` (the bench launcher's default since 2026-09-14)
+  runs the chunk recurrence as a prefix scan: 7% TTFT at the 3200 bucket,
+  neutral below, greedy/rowdep/parity clean. The forward wall is ~80 ms
+  plus ~0.1 ms/token: an 80 ms floor of per-layer graph launches (the
+  same floor as a decode step) and compiler-sliced small kernels above
+  it. Rewriting the mHC Sinkhorn or the KDA chunk length at the op level
+  did not move it (findings doc §20).
 
 - `VLLM_HPU_DECODE_TENSOR_CACHE` keeps the HPU-graph tensor cache for decode
   graphs; on for `glm5_next` without speculative decoding, off under it
