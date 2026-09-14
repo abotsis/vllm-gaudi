@@ -324,7 +324,12 @@ class HpuGlm5NextKdaAttention(GatedDeltaNetAttention):
 
         self.kv_cache: list[torch.Tensor] = []
         self.cache_group_idx = None
-        self.mamba_chunk_size = 64  # eager chunk kernel chunk size
+        # Chunk length of the prefill chunk kernel. 64 matches the reference
+        # (fla) chunking. Larger chunks halve the sequential chunk recurrence
+        # (the scan's tiny per-chunk ops dominate the KDA layer's kernel count
+        # at long prompts); the decay factors stay bounded by construction
+        # (see ops/hpu_kda_pytorch.py _decay_dot). VLLM_GLM_KDA_CHUNK.
+        self.mamba_chunk_size = int(os.environ.get("VLLM_GLM_KDA_CHUNK", "64"))
 
         self._tp_slice = slice(self.tp_rank * self.qkv_dim_local, (self.tp_rank + 1) * self.qkv_dim_local)
         self._head_slice = slice(self.tp_rank * self.num_heads, (self.tp_rank + 1) * self.num_heads)
@@ -919,6 +924,69 @@ def _mhc_pre_hpu_enabled() -> bool:
     return os.environ.get("VLLM_GLM_MHC_MIX_DTYPE", "bf16").strip().lower() == "bf16"
 
 
+# Sinkhorn layout for the mHC comb mix. "tm" (token-minor) runs the 2*iters
+# row/column normalisations on a [hc, hc, T] tensor so each reduce is over an
+# outer dim with T contiguous; the shipped [T, hc, hc] layout ("tj") reduces
+# over the 4-wide fastest dim and the TPC splits every one of the ~120 tiny
+# ops into ~60 kernels at T=3200 (about 15k kernels per layer, kernel-count
+# bound). Numerics: same fp32 ops, 4-term sums.
+_MHC_SINKHORN_TM = os.environ.get("VLLM_GLM_MHC_SINKHORN", "tj").strip().lower()
+_MHC_SEL_CACHE: dict = {}
+
+
+def _mhc_selectors(hc, device):
+    """Constant 0/1 selectors: R sums over j for each i, C sums over i for each j
+    (as [hc*hc, hc] fp32), and their transposes to expand [T, hc] back to [T, hc*hc]."""
+    key = (hc, str(device))
+    if key not in _MHC_SEL_CACHE:
+        eye = torch.eye(hc, dtype=torch.float32)
+        R = eye.repeat_interleave(hc, dim=0)  # row (i*hc+j) -> column i
+        C = eye.repeat(hc, 1)  # row (i*hc+j) -> column j
+        _MHC_SEL_CACHE[key] = tuple(t.to(device) for t in (R, C, R.t().contiguous(), C.t().contiguous()))
+    return _MHC_SEL_CACHE[key]
+
+
+def _mhc_sinkhorn(comb_mix, eps, repeat, token_minor):
+    """comb_mix [T, hc, hc] -> Sinkhorn-normalised [T, hc, hc] (contiguous).
+
+    token_minor: "tj" (shipped: reduce over the 4-wide fastest dim),
+    "tm" ([hc, hc, T] layout), "mm" (sums and broadcasts as [T,16]x[16,4]
+    and [T,4]x[4,16] fp32 GEMMs against constant selectors; every
+    elementwise op is a plain 2D [T,16] op)."""
+    if token_minor == "mm":
+        T, hc = comb_mix.shape[0], comb_mix.shape[-1]
+        R, C, Rt, Ct = _mhc_selectors(hc, comb_mix.device)
+        c = comb_mix.reshape(T, hc * hc)
+        c = c / (torch.matmul(torch.matmul(c, C) + eps, Ct))  # over i (dim -2)
+        for _ in range(repeat - 1):
+            c = c / (torch.matmul(torch.matmul(c, R) + eps, Rt))  # over j (dim -1)
+            c = c / (torch.matmul(torch.matmul(c, C) + eps, Ct))
+        return c.view(T, hc, hc)
+    if token_minor == "mmT":
+        # Same GEMM formulation on the transposed [hc*hc, T] tensor (selectors
+        # on the left), so the slicer works along the wide T dim.
+        T, hc = comb_mix.shape[0], comb_mix.shape[-1]
+        R, C, Rt, Ct = _mhc_selectors(hc, comb_mix.device)
+        c = comb_mix.reshape(T, hc * hc).t()  # [16, T]
+        c = c / torch.matmul(C, torch.matmul(Ct, c) + eps)  # over i
+        for _ in range(repeat - 1):
+            c = c / torch.matmul(R, torch.matmul(Rt, c) + eps)  # over j
+            c = c / torch.matmul(C, torch.matmul(Ct, c) + eps)
+        return c.t().contiguous().view(T, hc, hc)
+    if token_minor not in ("tm", True):
+        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(repeat - 1):
+            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + eps)
+            comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + eps)
+        return comb_mix
+    c = comb_mix.permute(1, 2, 0).contiguous()  # [i, j, T]
+    c = c / (c.sum(dim=0, keepdim=True) + eps)  # over i == dim -2 of [T, i, j]
+    for _ in range(repeat - 1):
+        c = c / (c.sum(dim=1, keepdim=True) + eps)  # over j == dim -1
+        c = c / (c.sum(dim=0, keepdim=True) + eps)
+    return c.permute(2, 0, 1).contiguous()
+
+
 def _mhc_pre_hpu(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
                  sinkhorn_repeat):
     """mhc_pre_torch with the mix GEMM on the bf16 MME path.
@@ -951,10 +1019,7 @@ def _mhc_pre_hpu(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkho
 
     comb_logits = (mixes[:, 2 * hc_mult:] * hc_scale[2] + hc_base[2 * hc_mult:]).view(num_tokens, hc_mult, hc_mult)
     comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
-        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+    comb_mix = _mhc_sinkhorn(comb_mix, hc_sinkhorn_eps, sinkhorn_repeat, _MHC_SINKHORN_TM)
 
     layer_input = torch.sum(pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1).to(torch.bfloat16)
     return (
