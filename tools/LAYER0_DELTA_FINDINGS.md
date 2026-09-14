@@ -802,4 +802,8 @@ forward context instead of opening a new one):
 | **attention on, attention graph** | 3.33 | **26.04** | **20.9** | 8/8 vs split | 12/12 |
 
 Now the plugin and launcher default (commit cbe0efa0). Confirmation boot on
-the plain launcher: run `launcher_mtp4_v3`.
+the plain launcher (run `launcher_mtp4_v3`, no env overrides): accepted
+length 3.33, aggregate 26.65 tok/s, single-stream 20.75 tok/s, greedy 8/8
+identical to `launcher_mtp4_attngraph3`, parity 12/12; the runner log
+reports "Inner graphed core: ATTENTION GRAPH". TTFT under MTP-4 (the draft
+prompt-cache fill is new per-request work): run `prefill_mtp4`.
