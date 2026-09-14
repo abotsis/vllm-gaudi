@@ -491,3 +491,27 @@ divergence that A and B never did in four boots. Not made default. Rerun to
 tell deterministic from racy; the real fix is a graph-safe draft attention
 (draft KV slot wiring), which would combine A's boundaries with B's
 acceptance and is the top MTP performance item.
+
+## 16. Shipped launcher validated end to end (2026-09-13 20:02-20:52)
+
+`/root/llm/glm53-bench/glm53_serve.sh` as now shipped (pinned decode recipe,
+one prompt per prefill forward, prefix caching off, MAXSEQ 32 nospec / 8 under
+speculation), driven by `launcher_gate.sh`:
+
+| launcher mode | parity (12 prompts) | acceptance | aggregate tok/s | single-stream tok/s |
+|---|---|---|---|---|
+| nospec, 32 seqs, prefix caching ON (first attempt) | 11/12 | n/a | n/a | 14.39 |
+| nospec, 32 seqs, prefix caching off | **12/12** | n/a | n/a | 14.14 |
+| MTP-4, 32 seqs (first attempt) | **hung**: decode config (160, 1, 256) not warmed up, compiled on the fly with heartbeat timeouts | | | |
+| MTP-4, 8 seqs | **12/12** | 2.405 | 20.89 | 17.56 |
+
+Launcher changes made today: `PBSD` default 4 -> 1; single decode recipe
+(`DECODE_LADDER=1` restores the ladder); `--no-enable-prefix-caching` by
+default (`PREFIX_CACHE=1` opts in, refused under speculation because the tree
+raises there); `MAXSEQ` defaults to 8 when `NSPEC>0`. Backup of the previous
+launcher: `glm53_serve.sh.bak_20260913`.
+
+Prefix caching is the one setting that still costs parity on the launcher
+(11/12 vs 12/12): a request that hits a cached prefix runs a different
+prefill shape than one that does not. It is off by default now; treating it
+is a separate item (mamba cache mode 'align' also changes KDA slot handling).
