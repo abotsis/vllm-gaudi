@@ -400,12 +400,12 @@ class HabanaMemoryProfiler:
             self.final_host_memory - self.initial_host_memory
 
 
-def setup_profiler(warmup, active):
+def setup_profiler(warmup, active, with_stack=True):
     schedule = torch.profiler.schedule(wait=0, warmup=warmup, active=active, repeat=1)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
     profiler = torch.profiler.profile(schedule=schedule,
                                       activities=activities,
                                       on_trace_ready=torch.profiler.tensorboard_trace_handler('.', use_gzip=True),
                                       record_shapes=False,
-                                      with_stack=True)
+                                      with_stack=with_stack)
     return profiler

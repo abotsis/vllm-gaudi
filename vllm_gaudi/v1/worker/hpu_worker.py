@@ -44,12 +44,23 @@ if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
 
 
-def setup_step_profiler(steps):
+def setup_step_profiler(steps, rank=0):
+    """torch.profiler over engine steps [start, end] (VLLM_PROFILE_STEPS=start,end).
+
+    VLLM_PROFILER_RANK0_ONLY=1 (default) arms it on rank 0 only: eight TP
+    workers each holding a profiler with Python stacks pushed a 125 GB host
+    over its limit (OOM killed a worker, then the user session) at the first
+    profiled step on GLM-5.3. VLLM_PROFILER_WITH_STACK=0 (default) drops the
+    stack capture for the same reason; set 1 for Python-attributed traces.
+    """
     if steps is None:
+        return None
+    if os.environ.get("VLLM_PROFILER_RANK0_ONLY", "1") == "1" and rank != 0:
         return None
     step_start, step_end = steps
     active = step_end - step_start + 1
-    return setup_profiler(warmup=0, active=active)
+    with_stack = os.environ.get("VLLM_PROFILER_WITH_STACK", "0") == "1"
+    return setup_profiler(warmup=0, active=active, with_stack=with_stack)
 
 
 class HPUWorker(WorkerBase):
@@ -80,7 +91,7 @@ class HPUWorker(WorkerBase):
         self.gc_track_recompiles = get_config().track_graph_compilation and not get_config().high_level_profiler_enabled
         self.step = 0
         self.profile_steps = get_config().VLLM_PROFILE_STEPS
-        self.step_profiler = setup_step_profiler(self.profile_steps)
+        self.step_profiler = setup_step_profiler(self.profile_steps, rank)
         self.step_debug = init_debug_logger('steps')
 
         self.model_sleeping = False
