@@ -5596,12 +5596,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # same storage twice fails at replay with "Neither storage
                     # attached to input tensor, not its view".
                     self.drafter.model = HpuModelAdapter(self.drafter.model, self.vllm_config)
-                    _gc = getattr(getattr(self.drafter.model, "model", None), "graph_core", None)
+                    _inner = getattr(self.drafter.model, "model", None)
+                    if getattr(_inner, "attn_graph_core", None) is not None:
+                        _core = "ATTENTION GRAPH (one replay per draft forward, attention included)"
+                    elif getattr(_inner, "graph_core", None) is not None:
+                        _core = "ENABLED (private weight copies, one replay per draft forward)"
+                    elif getattr(_inner, "pre_attention_graph_core", None) is not None:
+                        _core = "SPLIT (two replays around eager attention)"
+                    else:
+                        _core = "disabled (eager draft)"
                     logger.info(
                         "Draft head bound to the target's layer-45 modules; HpuModelAdapter without "
-                        "an outer HPU graph. Inner graphed core: %s.",
-                        "ENABLED (private weight copies, one replay per draft forward)"
-                        if _gc is not None else "disabled (eager draft)")
+                        "an outer HPU graph. Inner graphed core: %s.", _core)
                 else:
                     with HabanaMemoryProfiler() as m:  # noqa: SIM117
                         self.drafter.model = _maybe_wrap_in_hpu_graph(self.drafter.model, vllm_config=self.vllm_config)

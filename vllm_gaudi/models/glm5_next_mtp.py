@@ -35,10 +35,12 @@ import contextlib
 import torch
 import torch.nn as nn
 
-# The draft's self-attention is bypassed by default: measured, it corrupts
-# the draft's own predictions rather than helping (see forward()). Set
-# VLLM_GLM_MTP_DRAFT_ATTN=1 to restore it.
-_DRAFT_ATTN = os.environ.get("VLLM_GLM_MTP_DRAFT_ATTN", "0") == "1"
+# The draft's self-attention is ON by default (2026-09-14). It was bypassed
+# while the TP all-reduce corrupted rows >= 2 of every batch (the draft's
+# attention then read garbage context and scored worse than none); with the
+# all-reduce fixed it is worth +1.0 accepted token per step (mean accepted
+# length 2.41 -> 3.33-3.43). VLLM_GLM_MTP_DRAFT_ATTN=0 restores the bypass.
+_DRAFT_ATTN = os.environ.get("VLLM_GLM_MTP_DRAFT_ATTN", "1") == "1"
 
 # Diagnostic: scale the draft's attention contribution. Re-read per forward so a
 # sweep costs one request instead of a 12-minute reboot; only meaningful with the
@@ -106,6 +108,17 @@ def _pad_slot_metadata(attn_metadata):
 _DRAFT_GRAPH = os.environ.get("VLLM_GLM_MTP_DRAFT_GRAPH", "1") == "1"
 # Experimental local opt-in: graph only the tensor work around eager attention.
 _SPLIT_GRAPH = os.environ.get("VLLM_GLM_MTP_SPLIT_GRAPH", "0") == "1"
+# Graph-safe draft attention: ONE replay per decode-shaped draft forward that
+# includes the draft's MLA self-attention. The attention metadata tensors
+# (block_list, block_mapping, attn_bias, block_groups, slot_mapping, ...) are
+# passed as graph inputs and the forward context is rebuilt from them inside
+# the captured forward, so replays read fresh metadata instead of the
+# capture-time values. Needs VLLM_GLM_MTP_DRAFT_ATTN=1; takes precedence over
+# the split path. Default on (2026-09-14): MTP-4 aggregate 26.0 tok/s vs 20.2
+# bypassed and 20.3 split, single-stream 20.9 vs 17.3, greedy identical to the
+# split path, parity 12/12. VLLM_GLM_MTP_ATTN_GRAPH=0 falls back to the
+# split/eager paths.
+_ATTN_GRAPH = os.environ.get("VLLM_GLM_MTP_ATTN_GRAPH", "1") == "1"
 
 
 def _private_copy(module: nn.Module) -> nn.Module:
@@ -228,6 +241,85 @@ class _DraftGraphCore(nn.Module):
         return self.shared_head_norm(residual + x)
 
 
+def _md_tensor_fields(md) -> tuple[str, ...]:
+    """Names of the tensor-valued fields of an attention metadata object
+    (dataclass, namedtuple-style subtuple, or plain object)."""
+    import dataclasses
+    if dataclasses.is_dataclass(md):
+        names = [f.name for f in dataclasses.fields(md)]
+    elif hasattr(md, "_fields"):
+        names = list(md._fields)
+    else:
+        names = list(vars(md).keys())
+    return tuple(n for n in names if isinstance(getattr(md, n, None), torch.Tensor))
+
+
+def _md_replace(md, **updates):
+    """Copy of ``md`` with the given fields replaced (same three shapes)."""
+    import copy
+    import dataclasses
+    if dataclasses.is_dataclass(md):
+        return dataclasses.replace(md, **updates)
+    if hasattr(md, "_replace"):
+        return md._replace(**updates)
+    out = copy.copy(md)
+    for k, v in updates.items():
+        setattr(out, k, v)
+    return out
+
+
+class _DraftAttnGraphCore(nn.Module):
+    """Whole decode-shaped draft step, attention included, for HPU-graph capture.
+
+    Private copies of the light weights (as the other cores); the attention
+    layer and the MoE are the draft's own modules (not captured by the
+    target's graph, so no storage is captured twice). The persistent KV
+    cache bound to the attention layer is read/written in place like in the
+    target's graphs. Metadata tensors arrive as positional inputs; their
+    field names are fixed on the core before the call (Python state read at
+    capture only, identical for every decode-shaped call).
+    """
+
+    def __init__(self, mtp: nn.Module, embed_tokens: nn.Module):
+        super().__init__()
+        self.embed_tokens = _private_copy(embed_tokens)
+        self.enorm = _private_copy(mtp.enorm)
+        self.hnorm = _private_copy(mtp.hnorm)
+        self.eh_proj = _private_copy(mtp.eh_proj)
+        self.input_layernorm = _private_copy(mtp.input_layernorm)
+        self.self_attn = mtp.self_attn
+        self.post_attention_layernorm = _private_copy(mtp.post_attention_layernorm)
+        self.shared_head_norm = _private_copy(mtp.shared_head_norm)
+        self.mlp = mtp.mlp
+        self._md_fields: tuple[str, ...] = ()
+        self._md_base = None
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor,
+                *md_tensors: torch.Tensor) -> torch.Tensor:
+        from vllm.forward_context import get_forward_context
+        if len(md_tensors) != len(self._md_fields):
+            raise ValueError("draft attention graph: metadata tensor count does not match the field list")
+        md = _md_replace(self._md_base, **dict(zip(self._md_fields, md_tensors)))
+        embedding = self.embed_tokens(input_ids)
+        embedding = torch.where(positions.unsqueeze(-1) == 0, 0, embedding)
+        residual, _ = self.eh_proj(torch.cat([self.enorm(embedding), self.hnorm(hidden_states)], dim=-1))
+        # The adapter's forward context is active around this call (no vLLM
+        # config context exists at serving time, so a fresh set_forward_context
+        # is not possible here). Swap its attention metadata for the rebuilt
+        # one while the attention layer runs; the MLA layer reads it from the
+        # context (dict-per-layer or a single object).
+        ctx = get_forward_context()
+        old_md = ctx.attn_metadata
+        ctx.attn_metadata = {k: md for k in old_md} if isinstance(old_md, dict) else md
+        try:
+            attention = self.self_attn(positions=positions, hidden_states=self.input_layernorm(residual))
+        finally:
+            ctx.attn_metadata = old_md
+        attention = attention.reshape_as(residual)
+        states = residual + attention
+        return self.shared_head_norm(states + self.mlp(self.post_attention_layernorm(states)))
+
+
 class _DraftPreAttentionGraphCore(nn.Module):
     """Private light weights; attention and its cache remain outside capture."""
 
@@ -287,7 +379,13 @@ class HpuGlm5NextMTPModel(nn.Module):
         # Attention itself always uses the original modules and forward context.
         self.pre_attention_graph_core = None
         self.post_attention_graph_core = None
-        if _SPLIT_GRAPH and _DRAFT_GRAPH and _DRAFT_ATTN:
+        self.attn_graph_core = None
+        if _ATTN_GRAPH and _DRAFT_GRAPH and _DRAFT_ATTN:
+            import habana_frameworks.torch as htorch
+            self.attn_graph_core = htorch.hpu.wrap_in_hpu_graph(_DraftAttnGraphCore(mtp, self.embed_tokens),
+                                                                 disable_tensor_cache=True,
+                                                                 dry_run=False)
+        elif _SPLIT_GRAPH and _DRAFT_GRAPH and _DRAFT_ATTN:
             import habana_frameworks.torch as htorch
             self.pre_attention_graph_core = htorch.hpu.wrap_in_hpu_graph(_DraftPreAttentionGraphCore(
                 mtp, self.embed_tokens),
@@ -366,6 +464,14 @@ class HpuGlm5NextMTPModel(nn.Module):
             # bugs, at the graph/eager seam this time.
             htcore.mark_step()
             return out
+        if (self.attn_graph_core is not None and hidden_states.ndim == 3 and hidden_states.shape[1] == 1
+                and inputs_embeds is None and not _ATTN_SCALE_FILE):
+            md = attn_metadata
+            if md is None:
+                from vllm.forward_context import get_forward_context
+                md = get_forward_context().attn_metadata
+            if md is not None and not getattr(md, "is_prompt", False):
+                return self._forward_attn_graph(input_ids, positions, hidden_states, md)
         use_split = (self.pre_attention_graph_core is not None and self.post_attention_graph_core is not None
                      and hidden_states.ndim == 3 and hidden_states.shape[1] == 1 and inputs_embeds is None
                      and not _ATTN_SCALE_FILE)
@@ -378,6 +484,25 @@ class HpuGlm5NextMTPModel(nn.Module):
             with set_forward_context(attn_metadata, get_current_vllm_config()):
                 return forward_impl(input_ids, positions, hidden_states, inputs_embeds)
         return forward_impl(input_ids, positions, hidden_states, inputs_embeds)
+
+    def _forward_attn_graph(self, input_ids, positions, hidden_states, md) -> torch.Tensor:
+        import habana_frameworks.torch.core as htcore
+        batch = hidden_states.shape[0]
+        if input_ids.numel() != batch or positions.numel() != batch:
+            raise ValueError("MTP attention graph requires one input id and position per decode lane.")
+        core = self.attn_graph_core
+        names = _md_tensor_fields(md)
+        # Python state, read only when a shape is captured; the same for every
+        # decode-shaped metadata (the field set does not vary per step).
+        core._md_fields = names
+        core._md_base = md
+        md_tensors = [getattr(md, n) for n in names]
+        # Same input/output materialisation as the bypass core (see forward).
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        out = core(input_ids.reshape(batch, 1), positions.reshape(batch, 1), hidden_states, *md_tensors)
+        htcore.mark_step()
+        return out
 
     def _forward_split(
         self,
