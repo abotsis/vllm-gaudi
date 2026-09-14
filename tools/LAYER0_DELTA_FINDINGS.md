@@ -544,3 +544,38 @@ an unprepared bucket) and still beats the captured 2048 graph per token, so
 HPU-graph replay is not obviously the fast path for large prefills here.
 The MME budget at 3387 tok/s is ~3% of peak: prefill remains host/launch or
 TPC bound. Profile of steps at 1024/2048/3200 in the next section.
+
+## 18. Prefill profile (2026-09-14 08:28) and the KDA decay-dot fix
+
+Rank-0 torch-profiler trace of one 512-token prefill step (profiler confined
+to rank 0 without stacks; the 8-worker with-stack variant OOM-killed the
+host twice, see commit 4d7e8ecc):
+
+- step wall 156 ms, device union 160 ms of a 185 ms window: **86% device
+  busy**. Prefill is device-bound, not host-bound.
+- 981k kernel events in the step, mean 1.4 us; summed kernel time 1.38 s
+  across engines. Top: `reduce_sum_fwd_f32` 434 ms (140k), a fused fp32
+  elementwise kernel 191 ms, `GEMM` 71 ms (11.5k). The MME is a minority.
+- Under HPU-graph replay all kernels belong to one recipe, so attribution
+  came from a one-card microbenchmark (`tools/diag_kernel_counts.py`): one
+  KDA layer's `hpu_chunk_kda` at 512 tokens = 13.5k kernels, 57.6 ms summed,
+  2.6 ms device-union; x33 layers ~ 86 ms of the step's 160 ms (54%). At 2048
+  tokens 9.7 ms/layer (320 ms of ~1000). The mHC pre is ~120 kernels per
+  call (whole-tensor Sinkhorn), not a factor. The parallel chunk scan does
+  not change device time (the loop over 8 chunks is not the cost).
+- The cost was `_decay_dot`: sum_d a_i,d b_j,d exp(ga_i,d - gb_j,d) done as a
+  [B, tc, tc, 32] elementwise product per D-tile (~170 M fp32 elements per
+  layer at 512 tokens), reduced on the TPCs.
+
+Fix (commit c860b8ea): per 16-row block, split the exponent around the
+block's first-row gate and contract over D with a matmul on the MME; the
+gate lower bound (-5/token) keeps every factor inside fp32 (e^{+-80}),
+non-causal entries are clamped and masked. Per layer: 57.6 -> 3.7 ms summed,
+2.6 -> 0.3 ms union (512 tokens); 224 -> 14.3 ms, 9.7 -> 0.9 ms (2048).
+Oracle gates: transition tests 12/12 (CPU), test_hpu_kda 14/14 on HPU.
+Serving gates (TTFT sweep, greedy vs launcher_nospec_v2, rowdep, parity,
+bench) in the boot that follows.
+
+Still open from the sweep: the 2048 query bucket is superlinear (0.51
+ms/token vs 0.37 at 1024 and 0.29 at 3200) and the KDA share there is only
+~30%, so another component misbehaves at exactly that shape.
