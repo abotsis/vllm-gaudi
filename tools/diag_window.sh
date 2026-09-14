@@ -56,6 +56,13 @@ else
   BS_MIN="${BS_MIN:-1}"; BS_STEP="${BS_STEP:-8}"; BLK_MIN="${BLK_MIN:-1}"; PROMPT_BS_MIN="${PROMPT_BS_MIN:-1}"
 fi
 
+# NSPEC>0 adds MTP speculative decoding (the diagnostic roles require NSPEC=0;
+# ROLE=gate is the one meant for it).
+NSPEC="${NSPEC:-0}"
+SPEC=()
+if [ "$NSPEC" -gt 0 ]; then
+  SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${NSPEC}}")
+fi
 DIAG_DIR="${DIAG_DIR:-/tmp/glm53-mla-win-$STAMP}"   # direct child of /tmp (gate requirement)
 
 echo "--- waiting for cards ---"
@@ -80,13 +87,6 @@ if [ "$ROLE" = "capture" ] || [ "$ROLE" = "logits" ] || [ "$ROLE" = "state" ]; t
 fi
 echo "nspec=$NSPEC buckets: decode bs=($BS_MIN,$BS_STEP,$MAXSEQ) blocks=($BLK_MIN,512,3200) prompt bs=($PROMPT_BS_MIN,1,$PBSD) diag_dir=${VLLM_DIAG_SAMPLER_DIR:-none} acc_par=$PT_HPU_LAZY_ACC_PAR_MODE tensor_cache=${VLLM_HPU_DECODE_TENSOR_CACHE:-default} allreduce_markstep=${VLLM_HPU_ALLREDUCE_MARKSTEP:-0} hidden_layers=${VLLM_CONFIG_HIDDEN_LAYERS:-unset}"
 
-# NSPEC>0 adds MTP speculative decoding (the diagnostic roles require NSPEC=0;
-# ROLE=gate is the one meant for it).
-NSPEC="${NSPEC:-0}"
-SPEC=()
-if [ "$NSPEC" -gt 0 ]; then
-  SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${NSPEC}}")
-fi
 PLUGIN_DIR="$($PY -c 'import vllm_gaudi, os; print(os.path.dirname(os.path.dirname(vllm_gaudi.__file__)))')"
 case "$PLUGIN_DIR" in */vllm-gaudi-fresh) : ;; *) echo "FATAL: vllm_gaudi resolves to '$PLUGIN_DIR'"; exit 1 ;; esac
 
