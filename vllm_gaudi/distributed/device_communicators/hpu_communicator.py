@@ -35,9 +35,20 @@ _ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "0") == "1"
 #              VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES; larger buffers use hccl.
 #   fp32       upcast, dist.all_reduce, downcast: fewer order-dependent roundings.
 #   hccl       dist.all_reduce in the tensor's dtype (previous behaviour).
+#   transpose  all-reduce a hidden-major copy ([hidden, tokens] contiguous) and
+#              transpose back. If HCCL splits the flat buffer into a fixed
+#              number of contiguous chunks, an element's chunk then depends on
+#              its hidden index only, not on the token's row position or the
+#              token count, at 2x working memory instead of gather_sum's
+#              world_size x. Candidate for co-batched prefill; unproven.
 _ALLREDUCE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "gather_sum").strip().lower()
-if _ALLREDUCE_MODE not in ("hccl", "fp32", "gather_sum"):
-    raise ValueError(f"VLLM_HPU_ALLREDUCE_MODE must be hccl, fp32 or gather_sum, got {_ALLREDUCE_MODE!r}")
+if _ALLREDUCE_MODE not in ("hccl", "fp32", "gather_sum", "transpose"):
+    raise ValueError(f"VLLM_HPU_ALLREDUCE_MODE must be hccl, fp32, gather_sum or transpose, got {_ALLREDUCE_MODE!r}")
+# Buffers above the cap (co-batched prefill) use VLLM_HPU_ALLREDUCE_LARGE_MODE
+# in {hccl, fp32, transpose}; default hccl (previous behaviour).
+_ALLREDUCE_LARGE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_LARGE_MODE", "hccl").strip().lower()
+if _ALLREDUCE_LARGE_MODE not in ("hccl", "fp32", "transpose"):
+    raise ValueError(f"VLLM_HPU_ALLREDUCE_LARGE_MODE must be hccl, fp32 or transpose, got {_ALLREDUCE_LARGE_MODE!r}")
 # Inputs whose gathered/upcast working buffer would exceed this fall back to the
 # plain HCCL all-reduce. Every all-reduce site inside a captured graph retains
 # its working buffers, and a 3200-token prefill has ~88 sites: gather_sum at
@@ -100,16 +111,23 @@ class HpuCommunicator(DeviceCommunicatorBase):
             htorch.core.mark_step()
         working_bytes = input_.numel() * input_.element_size() * (self.world_size
                                                                   if _ALLREDUCE_MODE == "gather_sum" else 2)
-        if _ALLREDUCE_MODE == "gather_sum" and working_bytes <= _ALLREDUCE_ALT_MAX_BYTES:
+        mode = _ALLREDUCE_MODE if working_bytes <= _ALLREDUCE_ALT_MAX_BYTES else _ALLREDUCE_LARGE_MODE
+        if mode == "gather_sum":
             flat = input_.contiguous()
             gathered = torch.empty((self.world_size, ) + tuple(flat.shape), dtype=flat.dtype, device=flat.device)
             dist.all_gather_into_tensor(gathered, flat, group=self.device_group)
             input_.copy_(sum_in_rank_order(gathered, input_.dtype))
             return input_
-        if _ALLREDUCE_MODE == "fp32" and working_bytes <= _ALLREDUCE_ALT_MAX_BYTES:
+        if mode == "fp32":
             upcast = input_.float()
             dist.all_reduce(upcast, group=self.device_group)
             input_.copy_(upcast.to(input_.dtype))
+            return input_
+        if mode == "transpose" and input_.dim() >= 2:
+            rows = input_.reshape(-1, input_.shape[-1])
+            hidden_major = rows.transpose(0, 1).contiguous()
+            dist.all_reduce(hidden_major, group=self.device_group)
+            input_.copy_(hidden_major.transpose(0, 1).reshape(input_.shape))
             return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_

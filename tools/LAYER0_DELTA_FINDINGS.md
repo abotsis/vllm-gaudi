@@ -428,3 +428,27 @@ decode, the same class as the default-ladder 7/12, not a speculation defect.
 
 Still open: draft self-attention stays bypassed (its KV slot wiring, STATUS §7
 item 3); co-batched prefill (PBSD=2) parity untested on the fixed tree.
+
+## 14. Co-batched prefill (PBSD=4) on the fixed tree (2026-09-13 18:50)
+
+Pinned decode buckets, prompt bs pinned to 4 (`VLLM_PROMPT_BS_BUCKET_MIN=4`),
+gather_sum default with the 16 MiB cap:
+
+- rowdep `prose`: 4 distinct texts, 3/8 == serial, two rows diverge at **char 0**
+  (first token); `j_delta`: 8/8 identical.
+- parity 9/12 (code @52, prose @81, math @132). Prompt forwards ran (4,128),
+  (4,256), (4,512) plus chunked continuations.
+
+Cause: a 4-prompt prefill at the 128-token bucket is 512 tokens = 32 MiB of
+gathered working buffer, above the cap, so those sites use the plain HCCL
+reduction and a token's position in the co-batched buffer decides its
+rounding. Every all-reduce site in a captured graph retains its working
+buffers, which is why the cap exists (uncapped gather_sum died in prefill
+warmup). Per-site working memory: gather 8x, fp32 or transpose 2x, plain 0.
+
+Decision for the launcher: `PBSD=1`. Co-batched prefill bought the previous
+agent ~5-12% aggregate prefill throughput (c1 ~2000 vs c4 2105-2247 tok/s;
+prefill is MME-bound) and costs first-token determinism. Follow-up candidate,
+committed but untested: `VLLM_HPU_ALLREDUCE_LARGE_MODE=transpose`
+(hidden-major all-reduce; position-invariant if HCCL chunks the flat buffer
+by count; 2x memory). Test = a PBSD=4 parity boot with that env.
