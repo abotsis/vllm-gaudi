@@ -92,6 +92,14 @@ class HPUWorker(WorkerBase):
         self.step = 0
         self.profile_steps = get_config().VLLM_PROFILE_STEPS
         self.step_profiler = setup_step_profiler(self.profile_steps, rank)
+        # VLLM_PROFILE_MIN_TOKENS=N: only steps scheduling at least N tokens
+        # count toward the VLLM_PROFILE_STEPS window (self.profile_step), so a
+        # long-prompt profile is not consumed by readiness/calibration
+        # requests that precede it (a 3100-token probe once profiled its own
+        # 203-token calibration prefill and stopped the engine before the
+        # target request ran).
+        self.profile_min_tokens = int(os.environ.get("VLLM_PROFILE_MIN_TOKENS", "0"))
+        self.profile_step = 0
         self.step_debug = init_debug_logger('steps')
 
         self.model_sleeping = False
@@ -583,20 +591,25 @@ class HPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | None:
         if self.step_debug:
             self.step_debug(f'step={self.step}')
-        if self.step_profiler and self.step == self.profile_steps[0]:
+        counts_for_profile = (self.step_profiler is not None and getattr(
+            scheduler_output, "total_num_scheduled_tokens", self.profile_min_tokens) >= self.profile_min_tokens)
+        if counts_for_profile and self.profile_step == self.profile_steps[0]:
+            logger.info("step profiler start: engine step %d, profile step %d, %s scheduled tokens", self.step,
+                        self.profile_step, getattr(scheduler_output, "total_num_scheduled_tokens", "?"))
             self.step_profiler.start()
         with track_graph_compile('HPUWorker.execute_model') \
                 if self.gc_track_recompiles \
                 else contextlib.nullcontext():
             output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
         # TODO(woosuk): Send the output to the engine process.
-        if self.step_profiler:
-            if self.step >= self.profile_steps[0]:
+        if counts_for_profile:
+            if self.profile_step >= self.profile_steps[0]:
                 self.step_profiler.step()
-            if self.step == self.profile_steps[1]:
+            if self.profile_step == self.profile_steps[1]:
                 self.step_profiler.stop()
                 self.step_profiler = None
                 raise RuntimeError('Step profiling finished!')
+            self.profile_step += 1
         self.step += 1
         # NOTE(Harish): removed "if self.rank == 0 else None" for KV_connector enabling with TP>1
         # referred to Gpu Model Runner, KV connector aggregation expects valid output from all ranks
