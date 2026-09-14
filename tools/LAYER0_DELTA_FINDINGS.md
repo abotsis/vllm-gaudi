@@ -700,3 +700,31 @@ profiler slowdown (profiled TTFT 395 ms vs 213 unprofiled), not the
 per-layer anatomy (kernel classes, KDA vs MLA delta, Sinkhorn share) is
 still a valid picture of a 1024-bucket step; absolute per-layer times
 should not be quoted for 3200.
+
+### 20.2 Microbench ranking at 3200 tokens (11:00; one card, lazy graph, profiler on)
+
+`diag_kernel_counts.py` now reports device-span (first kernel start to
+last kernel end). Under the profiler every kernel costs ~1.2-1.5 us, so
+spans are inflated roughly in proportion to kernel count and are only a
+ranking, not a prediction of the server's per-layer time.
+
+| case (per call) | kernels | union ms | span ms |
+|---|---|---|---|
+| kda_seq chunk 64 | 21472 | 1.4 | 32.1 |
+| kda_seq chunk 128 | 17142 | 1.8 | - |
+| kda_seq chunk 256 | 16864 | 2.8 | - |
+| kda_parallel chunk 64 (prefix scan) | 12158 | 1.7 | 11.8 |
+| mhc_pre tj | 8541 | 0.7 | 2.0 |
+| mla_attn (FusedSDPA) | 605 | 0.3 | 0.6 |
+
+At 1024 tokens: kda_seq 13443 kernels / 13.8 ms span, kda_parallel 11157 /
+11.3, mhc_pre 7888 / 2.2 (its reduce/div counts, 2651/2276, are the ones
+in the §20 trace: that trace was the 1003-token step). Larger KDA chunks
+cost more device time for a 20% kernel cut (the [tc, tc] intra-chunk work
+grows) and differ from the reference by 2e-4 max-abs: not taken. The
+parallel prefix scan (`VLLM_KDA_SCAN=parallel`, bit-exact against the
+sequential recurrence in `test_kda_scan_matches_sequential` at rtol=0)
+halves the KDA kernel count at 50 chunks: measured on the launcher in run
+`prefill_kdapar` (below). The standalone fused-MoE case cannot register
+weights outside the real loader ("MOE multiplexer weights were partially
+registered") and was dropped.

@@ -71,11 +71,15 @@ def profile_once(fn):
         elif b > end:
             union += b - end
             end = b
-    return wall, sum(names.values()), sum(dur.values()) / 1000, names, dur, union / 1000
+    span = (max(b for _, b in ivs) - ivs[0][0]) / 1000 if ivs else 0.0
+    return wall, sum(names.values()), sum(dur.values()) / 1000, names, dur, union / 1000, span
 
 
-def report(label, wall, n, ms, names, dur, union, top=6):
-    print(f"\n{label}: wall {wall * 1000:8.1f} ms, {n:7d} kernels, summed {ms:8.1f} ms, device-union {union:8.1f} ms")
+def report(label, wall, n, ms, names, dur, union, span, top=6):
+    # span: first kernel start to last kernel end (the device-side critical
+    # path incl. dependency stalls); union: time with >= 1 kernel running.
+    print(f"\n{label}: wall {wall * 1000:8.1f} ms, {n:7d} kernels, summed {ms:8.1f} ms, "
+          f"device-union {union:8.1f} ms, device-span {span:8.1f} ms")
     for name, cnt in names.most_common(top):
         print(f"    {cnt:7d} x {dur[name] / max(cnt, 1):7.2f} us  {name[:60]}")
 
