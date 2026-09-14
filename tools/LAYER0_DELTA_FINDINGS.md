@@ -756,3 +756,13 @@ plus ~0.1 ms/token of compiler-sliced small kernels; neither moves with
 op-level PyTorch rewrites (mm Sinkhorn, KDA chunk length: no change).
 Next lever is structural (fewer graphs per step, VLLM_CONFIG_HIDDEN_LAYERS,
 run `prefill_hl2`), then a fused TPC path if the floor must go lower.
+
+### 20.4 Two layers per graph (VLLM_CONFIG_HIDDEN_LAYERS=2) rejected (11:44)
+
+Run `prefill_hl2` on top of the parallel scan: TTFT 3099 tokens 0.457 s
+(vs 0.451), 1003 0.225 (0.222), 123 0.142 (0.112): no prefill change. The
+3099 step's sample_tokens wait dropped 426 -> 300 ms but execute_model
+grew by the same amount (the grouped graph launches synchronously), so
+TTFT is unchanged. Decode bench 11.8 tok/s vs 13.7: -14%. Gates were
+clean (greedy 8/8, rowdep, parity 12/12) but the setting stays off. The
+per-step floor is not the graph count alone.
