@@ -766,3 +766,26 @@ execute_model at 0.3 ms in both runs, yet TTFT is unchanged (0.472 vs
 0.466 s): the wait moved to another engine call, not away. Decode bench 11.8 tok/s vs 13.7: -14%. Gates were
 clean (greedy 8/8, rowdep, parity 12/12) but the setting stays off. The
 per-step floor is not the graph count alone.
+
+## 21. MTP draft attention: split-graph rerun and the graph-safe core (2026-09-14 12:05)
+
+Rerun of §15b mode C on the current launcher (parallel KDA scan, MAXSEQ 8
+under speculation), `launcher_gate.sh` NSPEC=4 with
+`VLLM_GLM_MTP_DRAFT_ATTN=1 VLLM_GLM_MTP_SPLIT_GRAPH=1` (run
+`launcher_mtp4_split_rerun`): parity **12/12**, acceptance 3.33, aggregate
+20.29 tok/s, single-stream 16.7 tok/s. Greedy vs the bypass-mode launcher
+ref 5/8 (near-tie chars; a different draft changes the verify step's
+query count, the ordinary batch-shape limit). The 11/12 of §15b did not
+reproduce: not deterministic.
+
+Graph-safe draft attention (`VLLM_GLM_MTP_ATTN_GRAPH=1`, needs DRAFT_ATTN=1):
+`_DraftAttnGraphCore` captures the whole decode-shaped draft step, MLA
+self-attention included, as one HPU graph. The attention metadata's tensor
+fields are passed positionally as graph inputs and the forward context is
+rebuilt from them inside the captured forward, so each replay reads that
+step's block_list/block_mapping/attn_bias/block_groups/slot_mapping; the
+attention layer and MoE are the draft's own modules (never captured by the
+target graph), the light weights are private copies as in the other cores,
+and the layer-45 KV cache is the persistent buffer read/written in place.
+Replaces the split path's two replays + eager attention + four
+synchronizes with one replay. Gated in run `launcher_mtp4_attngraph`.
