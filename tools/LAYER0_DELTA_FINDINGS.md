@@ -722,8 +722,9 @@ At 1024 tokens: kda_seq 13443 kernels / 13.8 ms span, kda_parallel 11157 /
 in the §20 trace: that trace was the 1003-token step). Larger KDA chunks
 cost more device time for a 20% kernel cut (the [tc, tc] intra-chunk work
 grows) and differ from the reference by 2e-4 max-abs: not taken. The
-parallel prefix scan (`VLLM_KDA_SCAN=parallel`, bit-exact against the
-sequential recurrence in `test_kda_scan_matches_sequential` at rtol=0)
+parallel prefix scan (`VLLM_KDA_SCAN=parallel`; `test_kda_scan_matches_sequential`
+bounds it to <1e-4 relative Frobenius error vs the sequential loop, bit-exact
+only for a single chunk, so greedy may flip while rowdep/parity should hold)
 halves the KDA kernel count at 50 chunks: measured on the launcher in run
 `prefill_kdapar` (below). The standalone fused-MoE case cannot register
 weights outside the real loader ("MOE multiplexer weights were partially
