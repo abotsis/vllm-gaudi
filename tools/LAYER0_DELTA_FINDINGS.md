@@ -845,3 +845,30 @@ compile-free (88-token request 1.9 s for 48 output tokens, 8 concurrent
 x 200 tokens in 10.6 s = 150 tok/s aggregate). Making warmup run the
 drafter (its cores no longer share captured storage) would remove the
 client; it needs a gated boot and a restart of the live server.
+
+## 23. Sampled decode: the rejection sampler moved back to the device (2026-09-14 16:10-16:55)
+
+The user's llama-bench style numbers (tg128 6.3 t/s, tg1024 4.6 t/s)
+against the persistent MTP-4 server, reproduced: greedy tg128 23.6 tok/s,
+T=0.7/top_p 0.9 4.9, T=1.0 5.1. Every gate of the day had been greedy.
+py-spy on the rank-0 worker during a sampled generation: 73% of the step
+in `hpu_rejection_sampler.rejection_sample`, which pulled the target
+logits to the host as float64 and did temperature/top-k/top-p (two full-
+vocab sorts per row), softmax, gumbel recovery and the accept test there;
+16% model replay, 8% draft. The host path had been chosen after device
+formulations mis-executed under lazy mode (fused consumers of the RNG,
+in-place ops on shared storage; see the comments it replaced).
+
+Two commits. edc8b12f: host path in fp32 with one shared sort and
+inactive constraints skipped (equivalence 60/60 on CPU; 49 -> 31 ms per
+call, not enough). 60567fa4: the non-greedy math on the device, in one
+mark_step-bracketed segment on a private fp32 copy, top-k/top-p as per-row
+logit thresholds from a single sort (no scatter), draft token zeroed by a
+broadcast compare, results read after synchronize; the host path stays
+behind VLLM_HPU_REJECTION_HOST=1. Device vs host identical on 80/80 CPU
+batches; HPU sampler unit tests 13/13 on both paths.
+
+Launcher gate (run `launcher_mtp4_devsampler`, `bench_sampled.py` added to
+the gate): greedy 8/8 identical to launcher_mtp4_v3, parity 12/12,
+acceptance 3.33, aggregate 26.45 tok/s, greedy single-stream 21.3 tok/s,
+**sampled single-stream (T=0.7, top_p 0.9) 19.7 tok/s** (was ~5).

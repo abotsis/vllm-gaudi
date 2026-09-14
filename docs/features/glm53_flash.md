@@ -165,6 +165,13 @@ identical to the eager/split attention paths, serial-vs-concurrent parity
 `VLLM_GLM_MTP_DRAFT_ATTN=0` restores the bypass; `VLLM_GLM_MTP_ATTN_GRAPH=0`
 the split/eager paths.
 
+Sampling under speculation (2026-09-14): the non-greedy rejection-sampling
+math (temperature, top-k, top-p, softmax, recovery) runs on the device in a
+materialised segment; single-stream decode at T=0.7/top_p 0.9 is 19.7 tok/s
+against 21.3 greedy (it was ~5 tok/s with the host path, which
+`VLLM_HPU_REJECTION_HOST=1` restores). Greedy output is unaffected by
+construction (it returns before this code).
+
 Warmup under speculation: decode buckets are `num_reqs x (1 + num_spec)`
 lanes and are now warmed as verify batches (they used to compile on the
 first real request per shape, tens of seconds each, which read as 2 tok/s
