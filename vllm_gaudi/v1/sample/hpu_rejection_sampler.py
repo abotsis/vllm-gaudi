@@ -205,15 +205,21 @@ def sample_recovered_tokens(
     q = torch.stack(rows_q)
     htcore.mark_step()
 
-    inv_q = q.cpu().double().reciprocal()
+    # Host math in fp32 (upstream's triton kernel is fp32): the previous
+    # float64 copies doubled the D2H volume and the CPU time of the largest
+    # per-step tensors.
+    inv_q = q.cpu().float().reciprocal()
     drafts = draft_token_ids.cpu().long()
     # The HPU layout pads draft_token_ids past cu[-1] (rectangular buckets),
     # so trailing pad positions map past the last request -- clamp them onto
     # the final row. Their recovered values are never read: a padded draft id
-    # of -1 always rejects before recovery is consulted.
+    # of -1 always rejects before recovery is consulted. Callers may pass only
+    # the real rows (num_tokens == target_probs.shape[0]).
+    num_tokens = min(num_tokens, target_probs.shape[0], drafts.shape[0])
     rows = _token_to_request_rows(num_tokens, cu_num_draft_tokens.cpu()).clamp(max=batch_size - 1)
-    probs = target_probs.cpu().double() if target_probs.device.type != "cpu" else target_probs.double()
-    masked = probs.scatter(1, drafts.clamp(min=0).view(-1, 1), 0.0)
+    probs = target_probs[:num_tokens].cpu().float() if target_probs.device.type != "cpu" \
+        else target_probs[:num_tokens].float()
+    masked = probs.scatter(1, drafts[:num_tokens].clamp(min=0).view(-1, 1), 0.0)
     recovered = (masked * inv_q.index_select(0, rows)).argmax(dim=-1)
     return recovered.to(torch.int32).to(device)
 
@@ -234,11 +240,16 @@ def apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata):
 
 
 def _apply_constraints_cpu(logits_cpu, cu_cpu, sampling_metadata, num_tokens):
-    """Temperature/top-k/top-p on host, mirroring upstream semantics."""
+    """Temperature/top-k/top-p on host, mirroring upstream semantics.
+
+    fp32, one descending sort shared by top-k and top-p, and each constraint
+    skipped when no row in the batch uses it. The earlier float64 version
+    sorted the full vocab twice per row and was ~40% of a sampled MTP step.
+    """
     rows = _token_to_request_rows(num_tokens, cu_cpu).clamp(max=len(cu_cpu) - 1)
     temp = sampling_metadata.temperature
     if temp is not None:
-        t = temp.cpu().double().index_select(0, rows)
+        t = temp.cpu().float().index_select(0, rows)
         # The engine stores -1.0 as the greedy sentinel in the temperature
         # tensor (vLLM InputBatch convention), NOT GREEDY_TEMPERATURE == 0.
         # Dividing by -1 NEGATES the logits -- softmax then concentrates on the
@@ -247,24 +258,34 @@ def _apply_constraints_cpu(logits_cpu, cu_cpu, sampling_metadata, num_tokens):
         # argmax sat at -0.02. Treat any t <= 0 as greedy.
         t = torch.where(t <= 0, torch.ones_like(t), t)
         logits_cpu = logits_cpu / t.unsqueeze(-1)
-    top_k = sampling_metadata.top_k
-    if top_k is not None:
-        k = top_k.cpu().long().index_select(0, rows)
-        vocab = logits_cpu.shape[-1]
+    vocab = logits_cpu.shape[-1]
+    k = None
+    if sampling_metadata.top_k is not None:
+        k = sampling_metadata.top_k.cpu().long().index_select(0, rows)
         k = torch.where(k <= 0, torch.full_like(k, vocab), k).clamp(max=vocab)
-        kth = torch.sort(logits_cpu, dim=-1, descending=True).values.gather(-1, (k - 1).view(-1, 1))
-        logits_cpu = logits_cpu.masked_fill(logits_cpu < kth, float("-inf"))
-    top_p = sampling_metadata.top_p
-    if top_p is not None:
-        pv = top_p.cpu().double().index_select(0, rows).view(-1, 1)
-        sorted_logits, sorted_idx = torch.sort(logits_cpu, dim=-1, descending=True)
-        probs = torch.softmax(sorted_logits, dim=-1)
+        if bool((k >= vocab).all()):
+            k = None
+    pv = None
+    if sampling_metadata.top_p is not None:
+        pv = sampling_metadata.top_p.cpu().float().index_select(0, rows).view(-1, 1)
+        if bool((pv >= 1.0).all()):
+            pv = None
+    if k is None and pv is None:
+        return logits_cpu
+    sorted_logits, sorted_idx = torch.sort(logits_cpu, dim=-1, descending=True)
+    drop_sorted = torch.zeros_like(sorted_logits, dtype=torch.bool)
+    if k is not None:
+        # positions at or past k in descending order are outside the top-k
+        drop_sorted |= torch.arange(vocab).view(1, -1) >= k.view(-1, 1)
+    if pv is not None:
+        # top-p on the top-k-filtered distribution (upstream order: k then p)
+        kept = sorted_logits.masked_fill(drop_sorted, float("-inf"))
+        probs = torch.softmax(kept, dim=-1)
         cum = probs.cumsum(dim=-1)
         # keep tokens while the cumulative mass BEFORE them is < top_p
-        drop_sorted = (cum - probs) >= pv
-        drop = torch.zeros_like(drop_sorted).scatter(-1, sorted_idx, drop_sorted)
-        logits_cpu = logits_cpu.masked_fill(drop, float("-inf"))
-    return logits_cpu
+        drop_sorted |= (cum - probs) >= pv
+    drop = torch.zeros_like(drop_sorted).scatter(-1, sorted_idx, drop_sorted)
+    return logits_cpu.masked_fill(drop, float("-inf"))
 
 
 def rejection_sample(
@@ -340,7 +361,14 @@ def rejection_sample(
     # full pipeline to drain first.
     htcore.mark_step()
     torch.hpu.synchronize()
-    raw_logits_cpu = target_logits.cpu().double()
+    # Only the first cu[-1] token rows are real; the rest are bucket padding
+    # (draft id -1, always rejected, recovered value never read). Pull and
+    # process the real rows only, in fp32: with one request in a bucket of 8
+    # this is 8x less host work than the padded float64 path it replaces.
+    n_real = min(int(cu_cpu0[-1].item()), num_tokens) if len(cu_cpu0) else 0
+    if n_real == 0:
+        return greedy_out.to(device)
+    raw_logits_cpu = target_logits[:n_real].cpu().float()
     # Recompute the greedy sub-result from the HOST copy of the logits. In a
     # mixed batch the bonus sampler's random path (gumbel + generators) fuses
     # into the same device graph the argmax above ran in, and that graph
@@ -350,21 +378,27 @@ def rejection_sample(
     # All-greedy batches take the bonus sampler's greedy path (a different,
     # long-proven graph), which is why only mixed batches corrupt and why the
     # device argmax stays trusted on the all-greedy fast path above.
-    greedy_out = rejection_sample_pytorch(draft_token_ids, raw_logits_cpu.argmax(dim=-1), bonus_token_ids,
-                                          num_draft_tokens, cu_num_draft_tokens)
-    logits_cpu = _apply_constraints_cpu(raw_logits_cpu, cu_cpu0, sampling_metadata, num_tokens)
+    host_argmax = torch.zeros(num_tokens, dtype=torch.int64)
+    host_argmax[:n_real] = raw_logits_cpu.argmax(dim=-1)
+    greedy_out = rejection_sample_pytorch(draft_token_ids, host_argmax, bonus_token_ids, num_draft_tokens,
+                                          cu_num_draft_tokens)
+    logits_cpu = _apply_constraints_cpu(raw_logits_cpu, cu_cpu0, sampling_metadata, n_real)
     probs_cpu = torch.softmax(logits_cpu, dim=-1)
-    recovered = sample_recovered_tokens(max_spec_len, num_draft_tokens, cu_num_draft_tokens, draft_token_ids,
-                                        draft_probs, probs_cpu, sampling_metadata, device, use_fp64_gumbel)
+    recovered_real = sample_recovered_tokens(max_spec_len, num_draft_tokens, cu_num_draft_tokens,
+                                             draft_token_ids[:n_real], draft_probs, probs_cpu, sampling_metadata,
+                                             device, use_fp64_gumbel)
 
     drafts_cpu64 = draft_token_ids.cpu().long()
-    p_draft = probs_cpu.gather(-1, drafts_cpu64.clamp(min=0).view(-1, 1)).squeeze(-1)
+    p_draft = torch.zeros(num_tokens, dtype=probs_cpu.dtype)
+    p_draft[:n_real] = probs_cpu.gather(-1, drafts_cpu64[:n_real].clamp(min=0).view(-1, 1)).squeeze(-1)
     # Accept iff target_prob(draft) >= u (draft_prob treated as 1); a negative
     # draft id is a padded position and always rejects.
-    accept_cpu = (p_draft >= uniform.cpu()) & (drafts_cpu64 >= 0)
+    accept_cpu = (p_draft >= uniform.cpu().float()) & (drafts_cpu64 >= 0)
+    accept_cpu[n_real:] = False
 
     # ---- host assembly, same masking scheme as the greedy helper ----
-    recovered_cpu = recovered.cpu()
+    recovered_cpu = torch.zeros(num_tokens, dtype=torch.int32)
+    recovered_cpu[:n_real] = recovered_real.cpu()
     draft_cpu = draft_token_ids.cpu().to(torch.int32)
     bonus_cpu = bonus_token_ids.cpu().to(torch.int32).view(-1)
     cu_cpu = cu_num_draft_tokens.cpu()
