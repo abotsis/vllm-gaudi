@@ -660,3 +660,43 @@ Sinkhorn layouts tried (all bit-identical on CPU; `VLLM_GLM_MHC_SINKHORN`):
 | tj (shipped) | 8541 | 0.7 | reduce over fastest dim |
 | tm ([4,4,T], strided reduces) | - | - | graph compile did not finish in 12 min; dropped |
 | mm ([T,16] x [16,4] selector GEMMs) | 4597 | 0.4 | reduce_sum gone; div still 67/op (GEMM output sliced) ; max diff 1.8e-7 vs tj |
+| mmT (same on [16,T], selectors on the left) | 8282 | 0.6 | worse: the slicer chunks the wide dim too |
+
+The KDA chunk kernel at 3200 tokens (`--cases kda_seq`): 21.5 k kernels,
+1.4 ms union per layer (x33 = 46 ms per step): `add_fwd_f32` 10.4 k at
+0.11 us, `mult` 3360, `sub` 2976, `BatchGemm` 1552, one fused kernel 768.
+The tiny adds are the sequential chunk recurrence (50 chunks of 64 at
+3200 tokens; each per-chunk [8,64,128] op is sliced ~200 ways).
+`VLLM_GLM_KDA_CHUNK` (default 64) now sets the chunk length; on CPU the
+kernel at chunk 128/256 stays within 1e-6 max-abs of the eager reference
+(chunk 64 is 5e-8, it shares the reference's chunking).
+
+### 20.1 Forward wall by prompt bucket, and the mm layout on the launcher (10:55)
+
+`VLLM_DEBUG=steps` (commit pending) times the worker calls: `execute_model`
+returns in 0.3 ms for a 3099-token step (the lazy launch thread owns the
+work) and `sample_tokens` waits 448 ms. The high-level profiler's forward
+wall per prompt bucket (run `prefill_hlp`, unprofiled TTFT identical):
+
+| bucket | 128 | 256 | 512 | 1024 | 2048 | 3200 |
+|---|---|---|---|---|---|---|
+| forward wall ms | 82 | 81 | 128 | 152 | 265 | 437 |
+
+A ~80 ms floor (the same as a decode step: 194 per-layer graph launches)
+plus ~0.11 ms/token at 3200.
+
+mm Sinkhorn layout on the launcher (run `prefill_mhcmm`, gates in the
+same boot): TTFT 3099 tokens 0.490 s vs 0.487 (tj), 1995 0.310 vs 0.324,
+1003 0.213 vs 0.219, 507 0.166 vs 0.169: **no change** despite halving the
+mHC kernel count (2 x 45 calls x 0.3 ms union). Device-kernel union in an
+isolated microbench is not the critical path inside the per-layer graph;
+the TPC work overlaps something else. Default stays tj.
+
+Caveat on the trace in this section: ProfilerStep#0 (2.7 ms) is the
+1003-token `execute_model` (async, returns at once) and the 200 ms kernel
+window that follows is most likely that step's device work under
+profiler slowdown (profiled TTFT 395 ms vs 213 unprofiled), not the
+3099-token step, which launched right before the profiler stopped. The
+per-layer anatomy (kernel classes, KDA vs MLA delta, Sinkhorn share) is
+still a valid picture of a 1024-bucket step; absolute per-layer times
+should not be quoted for 3200.
