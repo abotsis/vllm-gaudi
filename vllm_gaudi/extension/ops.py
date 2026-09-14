@@ -1503,6 +1503,10 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
             # Synapse kernel -- the path the string-activation overload cannot
             # express because its enum has no clamped SiLU.
             x_fp8, x_scale = dynamic_quant(x)
+            # chunk_size: VLLM_MOE_CHUNK/VLLM_MOE_TOKEN_BOUNDARY as for the plain
+            # overload (0 = kernel default); _diag_chunk_size overrides for benches.
+            clamp_kwargs = self._get_extra_kwargs(tokens_num)
+            chunk_size = getattr(self, "_diag_chunk_size", clamp_kwargs.get("chunk_size", 0))
             return torch.ops.hpu.mixture_of_experts.bias_fp8_fused_weights(
                 x_fp8,
                 topk_ids.to(torch.int64),
@@ -1518,8 +1522,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                 permuted_weights=permuted_weights,
                 experts_min=self.experts_min,
                 experts_max=self.experts_max,
-                chunk_size=0,
-                total_experts=0,
+                chunk_size=chunk_size,
+                total_experts=self.global_num_experts if chunk_size else 0,
                 alpha=self.swiglu_alpha,
                 limit=self.swiglu_limit,
             )

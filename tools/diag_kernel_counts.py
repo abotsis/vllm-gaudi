@@ -83,10 +83,10 @@ def report(label, wall, n, ms, names, dur, union, top=6):
 def mhc_pre_fn():
     src = (ROOT / "vllm_gaudi/models/glm5_next.py").read_text()
     tree = ast.parse(src)
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_mhc_pre_hpu")
-    ns = {"torch": torch}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "glm5_next", "exec"), ns)
-    return ns["_mhc_pre_hpu"]
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_mhc_pre_hpu", "_mhc_sinkhorn", "_mhc_selectors")]
+    ns = {"torch": torch, "_MHC_SINKHORN_TM": "tj", "_MHC_SEL_CACHE": {}}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "glm5_next", "exec"), ns)
+    return ns
 
 
 def main():
@@ -95,6 +95,11 @@ def main():
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--cases", nargs="*", default=["kda_seq", "kda_parallel", "mhc_pre"])
+    ap.add_argument("--kda-chunk", type=int, nargs="*", default=[64], help="kda cases: chunk sizes to run")
+    ap.add_argument("--mhc-layouts", nargs="*", default=["tj", "mm"],
+                    help="mhc_pre case: Sinkhorn layouts to compare (first is the reference)")
+    ap.add_argument("--moe-chunk", type=int, nargs="*", default=[0],
+                    help="moe case: chunk_size values to pass to the fused op (0 = as shipped)")
     args = ap.parse_args()
     dev = torch.device("hpu")
     kda = importlib.import_module("vllm_gaudi.ops.hpu_kda_pytorch")
@@ -107,8 +112,17 @@ def main():
         for case in args.cases:
             if case.startswith("kda_"):
                 kda._KDA_SCAN_PARALLEL = case == "kda_parallel"
-                out = profile_once(lambda q=q, k=k, v=v, g=g, beta=beta: kda.hpu_chunk_kda(q, k, v, g, beta))
-                report(f"T={T} {case}", *out)
+                outs = {}
+                for cs in args.kda_chunk:
+                    outs[cs] = kda.hpu_chunk_kda(q, k, v, g, beta, chunk_size=cs)
+                    out = profile_once(
+                        lambda q=q, k=k, v=v, g=g, beta=beta, cs=cs: kda.hpu_chunk_kda(q, k, v, g, beta, chunk_size=cs))
+                    report(f"T={T} {case} chunk={cs}", *out)
+                ref = args.kda_chunk[0]
+                for cs in args.kda_chunk[1:]:
+                    a, b = outs[ref][0].float(), outs[cs][0].float()
+                    print(f"    out: max|chunk{ref}-chunk{cs}| = {(a - b).abs().max().item():.3e}, "
+                          f"rel = {((a - b).norm() / a.norm()).item():.3e}")
             elif case == "mla_attn":
                 # MLA prefill attention as forward_mha issues it: [bs=1, T, H, 256] bf16, causal,
                 # valid_seq_lengths=[T], FusedSDPA through the plugin wrapper.
@@ -136,16 +150,51 @@ def main():
                                                     values_fetch_func=None,
                                                     fsdpa_op=fsdpa))
                 report(f"T={T} mla_attn (one layer; 11 MLA layers per forward)", *out)
+            elif case == "moe":
+                # One GLM-5.3 MoE layer's routed experts as the launcher runs them:
+                # the Habana fused fp8 per-channel op on the clamped-SwiGLU overload,
+                # 288 experts, TP=8 slice of the 2048-wide intermediate, top-8 routing.
+                from vllm_gaudi.extension import ops as ext_ops
+                E, H, I8, K = 288, 4096, 2048 // 8, 8
+                op = ext_ops.VllmMixtureOfExpertsOpFP8PerChannel(E, E, 0, E - 1)
+                for e in range(E):
+                    w13 = torch.randn(2 * I8, H, generator=g_).mul_(0.02).to(torch.float8_e4m3fn).to(dev)
+                    w2 = torch.randn(H, I8, generator=g_).mul_(0.02).to(torch.float8_e4m3fn).to(dev)
+                    op.w13_list[e].set_weight(w13)
+                    op.w2_list[e].set_weight(w2)
+                    # per-channel scales as the fp8 checkpoint loads them: fp32 [N, 1]
+                    op.w13_list[e].set_scale_inv_fp8(torch.full((2 * I8, 1), 1.0, device=dev, dtype=torch.float32))
+                    op.w2_list[e].set_scale_inv_fp8(torch.full((H, 1), 1.0, device=dev, dtype=torch.float32))
+                op.enable_clamped_swiglu(alpha=1.0, limit=10.0)
+                xm = torch.randn(T, H, generator=g_).to(torch.bfloat16).to(dev)
+                scores = torch.rand(T, E, generator=g_)
+                tw, ti = scores.topk(K, dim=-1)
+                tw = (tw / tw.sum(-1, keepdim=True)).to(torch.bfloat16).to(dev)
+                ti = ti.to(torch.int64).to(dev)
+                for chunk in args.moe_chunk:
+                    op._diag_chunk_size = chunk
+                    out = profile_once(lambda op=op, xm=xm, ti=ti, tw=tw: op(xm, ti, tw, permuted_weights=True))
+                    report(f"T={T} moe chunk_size={chunk} (one layer; 42 MoE layers per forward)", *out)
             elif case == "mhc_pre":
-                f = mhc_pre_fn()
+                ns = mhc_pre_fn()
+                f = ns["_mhc_pre_hpu"]
                 hc, hidden = 4, 4096
                 residual = torch.randn(T, hc, hidden, generator=g_).to(torch.bfloat16).to(dev)
                 fnw = torch.randn((2 + hc) * hc, hc * hidden, generator=g_).to(dev)
                 hc_scale = torch.ones(3, device=dev)
                 hc_base = torch.zeros((2 + hc) * hc, device=dev)
-                out = profile_once(
-                    lambda f=f, r=residual, w=fnw, sc=hc_scale, b=hc_base: f(r, w, sc, b, 1e-5, 1e-6, 1e-6, 1.0, 20))
-                report(f"T={T} mhc_pre (one call; ~90 calls per forward)", *out)
+                outs = {}
+                for layout in args.mhc_layouts:
+                    ns["_MHC_SINKHORN_TM"] = layout
+                    outs[layout] = f(residual, fnw, hc_scale, hc_base, 1e-5, 1e-6, 1e-6, 1.0, 20)
+                    out = profile_once(lambda f=f, r=residual, w=fnw, sc=hc_scale, b=hc_base: f(
+                        r, w, sc, b, 1e-5, 1e-6, 1e-6, 1.0, 20))
+                    report(f"T={T} mhc_pre sinkhorn={layout} (one call; ~90 calls per forward)", *out)
+                ref = args.mhc_layouts[0]
+                for layout in args.mhc_layouts[1:]:
+                    a, b = outs[ref][1].float(), outs[layout][1].float()
+                    print(f"    comb_mix: max|{ref}-{layout}| = {(a - b).abs().max().item():.3e}, "
+                          f"bitwise-equal = {bool(torch.equal(a, b))}")
 
 
 if __name__ == "__main__":
