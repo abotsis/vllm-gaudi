@@ -515,3 +515,32 @@ Prefix caching is the one setting that still costs parity on the launcher
 (11/12 vs 12/12): a request that hits a cached prefix runs a different
 prefill shape than one that does not. It is off by default now; treating it
 is a separate item (mamba cache mode 'align' also changes KDA slot handling).
+
+## 17. Prefill: TTFT sweep on the shipped launcher (2026-09-13 22:13)
+
+`tools/diag_prefill_probe.py sweep` through `glm53-bench/prefill_gate.sh`
+(nospec, 32 seqs pinned, one prompt per forward, max_tokens=1, median of 3):
+
+| prompt tokens | bucket | TTFT s | tok/s | note |
+|---|---|---|---|---|
+| 123 | 128 | 0.139 | 885 | fixed cost ~0.11 s dominates |
+| 139 | 256 | 0.166 | 835 | |
+| 251 | 256 | 0.172 | 1456 | |
+| 267 | 512 | 0.244 | 1093 | +42% for crossing the edge |
+| 507 | 512 | 0.249 | 2037 | |
+| 523 | 1024 | 0.378 | 1383 | +52% for crossing the edge |
+| 1003 | 1024 | 0.377 | 2659 | |
+| 1035 | 2048 | 1.015 | 1019 | **+170%** for crossing the edge |
+| 1995 | 2048 | 1.046 | 1907 | |
+| 2059 | 3200 (un-warmed, added on the fly) | 0.931 | 2212 | faster than the 2048 graph |
+| 3099 | 3200 | 0.915 | 3387 | best per-token rate |
+
+Two things stand out. (1) The query-bucket ladder 128/256/512/1024/2048/3200
+has an edge at 1024 that costs 2.7x for the next token, and the 2048 bucket
+itself is superlinear: 0.51 ms/token vs 0.37 at 1024 and 0.29 at 3200.
+(2) The 3200 shape was not in the warmup list ("Generated 10 prompt
+buckets" stops at 2048; the first 2059-token request added (1, 3200, 0) as
+an unprepared bucket) and still beats the captured 2048 graph per token, so
+HPU-graph replay is not obviously the fast path for large prefills here.
+The MME budget at 3387 tok/s is ~3% of peak: prefill remains host/launch or
+TPC bound. Profile of steps at 1024/2048/3200 in the next section.
