@@ -166,6 +166,16 @@ identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.
 
 ## Performance notes on this port
 
+- Prefill (2026-09-14): the KDA chunk kernel's intra-chunk decay dot runs as
+  blocked MME matmuls instead of per-tile elementwise products (see
+  `_decay_dot` in `ops/hpu_kda_pytorch.py`). TTFT on the shipped launcher:
+  507 tokens 0.249 -> 0.168 s, 1003 tokens 0.377 -> 0.218 s, 1995 tokens
+  1.046 -> 0.324 s, 3099 tokens 0.915 -> 0.479 s (6.5k tok/s). Prefill is
+  device-bound on small fp32 TPC kernels, not on the MME; attention and the
+  mHC mixing are minor at every bucket. Prompt-query buckets are
+  128/256/512/1024/2048/3200: a prompt just over an edge pays the next
+  bucket (30-50% TTFT), so size `VLLM_PROMPT_QUERY_BUCKET_*` to the workload.
+
 - `VLLM_HPU_DECODE_TENSOR_CACHE` keeps the HPU-graph tensor cache for decode
   graphs; on for `glm5_next` without speculative decoding, off under it
   (the doubled graph count exceeds host memory at TP=8).
