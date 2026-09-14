@@ -163,8 +163,16 @@ launcher at MTP-4: mean accepted length 3.33 (bypass 2.41), aggregate
 identical to the eager/split attention paths, serial-vs-concurrent parity
 12/12. The earlier bypass verdict dated from the all-reduce row corruption.
 `VLLM_GLM_MTP_DRAFT_ATTN=0` restores the bypass; `VLLM_GLM_MTP_ATTN_GRAPH=0`
-the split/eager paths. The draft graph captures at serving time per decode
-shape (warmup skips the draft), so the first request per shape compiles.
+the split/eager paths.
+
+Warmup under speculation: decode buckets are `num_reqs x (1 + num_spec)`
+lanes and are now warmed as verify batches (they used to compile on the
+first real request per shape, tens of seconds each, which read as 2 tok/s
+in a session that crossed three block buckets). The draft itself is still
+skipped by warmup, so its prompt-cache fill (per prompt bucket) and its
+attention graph (per decode shape) compile on first use, 2-8 s each; the
+bench launcher runs a warm client after /health to pay those before users
+do.
 
 Tools: `tools/diag_window_driver.py rowdep` (identical prompts must give
 identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.

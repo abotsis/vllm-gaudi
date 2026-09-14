@@ -807,3 +807,41 @@ length 3.33, aggregate 26.65 tok/s, single-stream 20.75 tok/s, greedy 8/8
 identical to `launcher_mtp4_attngraph3`, parity 12/12; the runner log
 reports "Inner graphed core: ATTENTION GRAPH". TTFT under MTP-4 (the draft
 prompt-cache fill is new per-request work): run `prefill_mtp4`.
+
+## 22. The 2 tok/s session: un-warmed speculative shapes (2026-09-14 14:20-15:40)
+
+The persistent MTP-4 server served the user's first session at ~2 tok/s
+while the gate benches said 20+. The engine log had the cause:
+`('decode', 40, 1, 128/256/512) was not warmed-up!` and
+`Prompt bucket for (1, 2108, 0) was not prepared. Adding new bucket (1, 3200, 0)`.
+
+- Under speculation a decode step is num_reqs x (1 + num_spec) lanes (8 x 5
+  = 40). The bucketing manager generates those buckets, but warmup built
+  each bucket as bs one-token dummy requests, which the 8-slot input batch
+  cannot hold, so the spec buckets were skipped by design ("capture
+  on-the-fly at runtime"). Every gate boot paid one such compile inside
+  its first bench rep and hid it in the median; a real session crossing
+  three block buckets paid three, tens of seconds each.
+- The prompt query buckets 128/2048/3200 never contained 3200 (the range
+  generator stops on the step grid), so the first prompt over 2048 tokens
+  compiled the 3200 bucket at runtime, in every boot of the day.
+
+Fixes (commit b8d2ea1b): the dummy scenario builds spec buckets as
+num_reqs requests scheduled 1 + num_spec tokens with dummy draft ids, sized
+from num_blocks / lanes (every lane carries its request's block table: 8
+reqs x 16 blocks x 5 lanes landed on the 640 bucket instead of 128 on the
+first attempt); `warmup_range()` emits the configured max. Verified on the
+serving box: no un-warmed shape across a walk of long prompts, long
+generations and 4-8 concurrent streams; warmup 190 s / 8.2 GiB of graphs
+(was 137 s / 3.7 GiB).
+
+What still compiles lazily: the MTP draft itself. Warmup skips the
+drafter, so the draft's prompt-cache fill compiles once per prompt bucket
+and the draft attention graph once per decode shape, 2-8 s each on the
+first request that reaches them. `glm53_serve.sh` now runs
+`warm_client.py` after /health answers (WARM_CLIENT=0 disables), which
+touches every prompt bucket and the common decode shapes; a second pass is
+compile-free (88-token request 1.9 s for 48 output tokens, 8 concurrent
+x 200 tokens in 10.6 s = 150 tok/s aggregate). Making warmup run the
+drafter (its cores no longer share captured storage) would remove the
+client; it needs a gated boot and a restart of the live server.
