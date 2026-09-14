@@ -138,10 +138,28 @@ the same request served alone. They were separated on 2026-09-13 with
    recipe: `VLLM_DECODE_BS_BUCKET_MIN=8 VLLM_DECODE_BS_BUCKET_STEP=8
    VLLM_DECODE_BLOCK_BUCKET_MIN=32` (and `VLLM_PROMPT_BS_BUCKET_MIN` equal to
    the prompt bucket max when co-batched prefill is on): 12/12 identical.
-   Measured at `--max-num-seqs 8`: 15.0 tok/s single-stream vs 14.7 on the
-   default ladder (same within restart noise), and warmup drops from ~13 to
-   ~2 minutes because there is one decode bucket. At larger max_num_seqs the
-   padded lone decode may cost real time; measure before adopting.
+   Measured single-stream: 15.0 tok/s pinned at 8 sequences, 14.0 pinned at
+   32, vs 13.6-14.7 on the default ladder, all within restart noise (decode
+   is host-launch-bound; padded rows are free), and warmup drops from ~13 to
+   ~2 minutes because there is one decode bucket. The reference launcher
+   (`glm53_serve.sh`) ships this recipe; `DECODE_LADDER=1` restores the ladder.
+3. **Co-batched prefill (inherent at the current cap).** With
+   `VLLM_PROMPT_BS_BUCKET_MAX>1` a prefill of four prompts at the smallest
+   bucket is already 512 tokens, above the 16 MiB working-buffer cap, so those
+   all-reduces take the position-dependent path and a prompt's first tokens
+   depend on where it sat in the prefill batch (parity 9/12, first-token
+   flips). Co-batched prefill bought ~5-12% aggregate prefill throughput, so
+   the launcher defaults to one prompt per prefill forward.
+   `VLLM_HPU_ALLREDUCE_LARGE_MODE=transpose` (hidden-major all-reduce, 2x
+   working memory) is the untested candidate for having both.
+
+MTP note: with the all-reduce fixed, the draft's own self-attention
+(`VLLM_GLM_MTP_DRAFT_ATTN=1`) raises mean accepted length from 2.41 to 3.43
+(per-position 0.91/0.71/0.48/0.32). It currently forces the eager draft
+(12.9 tok/s single-stream vs 17.3 bypassed); with `VLLM_GLM_MTP_SPLIT_GRAPH=1`
+it reaches 22.1 tok/s aggregate (best measured) at 16.2 single-stream but
+showed one late serial-vs-concurrent divergence in 12 prompts, so the bypass
+stays the default until the draft attention is graph-safe.
 
 Tools: `tools/diag_window_driver.py rowdep` (identical prompts must give
 identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.
