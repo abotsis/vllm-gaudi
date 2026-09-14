@@ -83,7 +83,6 @@ def _kda_prefix_states(m_full, n_t, x0):
 
 # Channel tile for the difference-based decay contraction: bounds the
 # [SC*H, tc, tc, D_TILE] fp32 transient (~SC*H*tc^2*D_TILE*4 bytes).
-_D_TILE = 32
 
 _NEUMANN_ITERS = int(os.environ.get("VLLM_KDA_NEUMANN_ITERS", "16"))
 
@@ -98,6 +97,14 @@ _NEUMANN_ITERS = int(os.environ.get("VLLM_KDA_NEUMANN_ITERS", "16"))
 _KDA_SCAN_PARALLEL = os.environ.get("VLLM_KDA_SCAN", "seq").strip().lower() \
     in ("parallel", "1", "true")
 
+# Rows per exponent reference in _decay_dot. The per-channel log decay is
+# bounded below by the model's gate_lower_bound (-5 per token for GLM-5.3),
+# so within a block of 16 rows the cumulative decay moves by at most 80 nats
+# and e^{+-80} stays inside fp32 (ln(max) = 88.7). Larger blocks overflow in
+# the worst case; smaller ones only add matmul calls.
+_DECAY_BLOCK = 16
+_DECAY_EXP_MAX = 5.0 * _DECAY_BLOCK
+
 
 def _decay_dot(
     a: torch.Tensor,
@@ -107,20 +114,29 @@ def _decay_dot(
 ) -> torch.Tensor:
     """sum_d a[..., i, d] * b[..., j, d] * exp(ga[..., i, d] - gb[..., j, d]).
 
-    All inputs [..., tc, D] (already flattened to [B, tc, D] batch); returns
-    [B, tc, tc]. Tiled over D; differences only (bounded <= 1 for ordered
-    indices), never exp of an unbounded cumsum.
+    All inputs [B, tc, D]; returns [B, tc, tc]. Only entries with j <= i are
+    consumed (the callers apply tril), and ga/gb are per-chunk cumulative log
+    decays: non-increasing along the row axis, with a bounded per-row step.
+
+    Computed as a matmul on the MME per block of rows: for rows i in a block
+    starting at i0, with the reference c = ga[i0],
+        exp(ga_i - gb_j) = exp(ga_i - c) * exp(c - gb_j),
+    the first factor is in [e^-80, 1] (ga is non-increasing) and the second is
+    <= 1 for j < i0, <= e^80 for j inside the block, and only non-causal
+    entries (masked by the caller) could exceed it, so it is clamped at e^80
+    to keep them finite. Replaces the previous per-D-tile elementwise product
+    (a [B, tc, tc, dt] tensor per tile, ~170 M elements per layer at 512
+    tokens, ~54% of prefill device time); the matmul does the D contraction.
     """
     B, tc, D = a.shape
-    out = torch.zeros(B, tc, tc, dtype=torch.float32, device=a.device)  # zeros: empty garbage + inf +=  can leak NaN
-    for d0 in range(0, D, _D_TILE):
-        d1 = min(d0 + _D_TILE, D)
-        at = a[..., d0:d1]  # [B, tc, dt]
-        bt = b[..., d0:d1]  # [B, tc, dt]
-        decay = (ga[..., None, d0:d1] - gb[:, None, ..., d0:d1]).exp_()  # [B, tc(i), tc(j), dt]
-        prod = at[:, :, None, :] * bt[:, None, :, :] * decay  # [B, tc, tc, dt]
-        out += prod.sum(-1)
-    return out
+    blocks = []
+    for i0 in range(0, tc, _DECAY_BLOCK):
+        i1 = min(i0 + _DECAY_BLOCK, tc)
+        c = ga[:, i0:i0 + 1, :]  # [B, 1, D] reference per channel
+        ai = a[:, i0:i1] * (ga[:, i0:i1] - c).exp()  # [B, blk, D], factors in [e^-80, 1]
+        bj = b * (c - gb).clamp_(max=_DECAY_EXP_MAX).exp()  # [B, tc, D], causal entries exact
+        blocks.append(torch.matmul(ai, bj.transpose(-1, -2)))  # [B, blk, tc]
+    return torch.cat(blocks, dim=1) if len(blocks) > 1 else blocks[0]
 
 
 def hpu_chunk_kda(
