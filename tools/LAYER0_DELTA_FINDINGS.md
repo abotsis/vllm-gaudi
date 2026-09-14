@@ -761,8 +761,8 @@ run `prefill_hl2`), then a fused TPC path if the floor must go lower.
 
 Run `prefill_hl2` on top of the parallel scan: TTFT 3099 tokens 0.457 s
 (vs 0.451), 1003 0.225 (0.222), 123 0.142 (0.112): no prefill change. The
-3099 step's sample_tokens wait dropped 426 -> 300 ms but execute_model
-grew by the same amount (the grouped graph launches synchronously), so
-TTFT is unchanged. Decode bench 11.8 tok/s vs 13.7: -14%. Gates were
+2059-token step's sample_tokens wait dropped 426 -> 300 ms with
+execute_model at 0.3 ms in both runs, yet TTFT is unchanged (0.472 vs
+0.466 s): the wait moved to another engine call, not away. Decode bench 11.8 tok/s vs 13.7: -14%. Gates were
 clean (greedy 8/8, rowdep, parity 12/12) but the setting stays off. The
 per-step floor is not the graph count alone.
