@@ -6332,6 +6332,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def _prepare_dummy_scenario(self, prompt_cfg, decode_cfg):
         requests: list[NewRequestData] = []
         scheduled_tokens: dict[str, int] = {}
+        spec_tokens: dict[str, list[int]] = {}
 
         if prompt_cfg:
             prompt_bs, prompt_query_len, prompt_num_blocks = prompt_cfg
@@ -6374,11 +6375,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                             is_prompt=True)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
-            # Spec-decode buckets inflate bs to num_reqs * (1 + num_spec_tokens),
-            # but input_batch only has max_num_reqs slots. Cap the dummy request
-            # count at max_num_reqs; spec-decode buckets that exceed it are
-            # skipped in warmup_graphs and capture on-the-fly at runtime.
-            capped_decode_bs = min(decode_bs, self.max_num_reqs)
+            # Spec-decode buckets inflate bs to num_reqs * (1 + num_spec_tokens)
+            # (8 seqs x 5 = 40 lanes for MTP-4) while input_batch has
+            # max_num_reqs slots. Build those buckets the way the verify step
+            # runs them: num_reqs requests, each scheduled 1 + num_spec tokens
+            # with num_spec dummy draft ids. Before this they were skipped and
+            # compiled on the first real request per (bs, blocks) shape --
+            # tens of seconds each, measured as ~2 tok/s for a user session
+            # that crossed three block buckets. Shapes that still cannot be
+            # expressed fall back to the capped one-token batch.
+            num_spec = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+            spec_lanes = 1 + num_spec
+            if (num_spec and decode_bs > self.max_num_reqs and decode_bs % spec_lanes == 0
+                    and decode_bs // spec_lanes <= self.max_num_reqs):
+                capped_decode_bs = decode_bs // spec_lanes
+                tokens_per_req = spec_lanes
+            else:
+                capped_decode_bs = min(decode_bs, self.max_num_reqs)
+                tokens_per_req = 1
             # Use attn_block_size (the actual kernel block granularity used in
             # _create_decode_input_data) rather than block_size (the KV-manager
             # page size).  For hybrid models these differ after
@@ -6401,7 +6415,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # block_id as the allocation base which must be valid.
                 block_id = min(decode_num_blocks - 1, self.kv_cache_config.num_blocks - 1)
             else:
-                decode_seq_lengths = self._generate_seq_lengths(capped_decode_bs, decode_num_blocks, decode_block_size)
+                # Under speculation every lane of a request carries the
+                # request's block table, so the bucket's block count is
+                # num_reqs x lanes x blocks_per_req: size the dummy sequences
+                # from num_blocks / lanes or the run lands on a larger bucket
+                # (8 reqs x 16 blocks x 5 lanes = 640, not 128).
+                dummy_blocks = max(capped_decode_bs, decode_num_blocks // tokens_per_req)
+                decode_seq_lengths = self._generate_seq_lengths(capped_decode_bs, dummy_blocks, decode_block_size)
                 block_id = 0
 
             for dsl in decode_seq_lengths:
@@ -6409,12 +6429,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                         scheduled_tokens,
                                         num_computed_tokens=dsl,
                                         total_tokens=dsl,
-                                        scheduled_tokens=1,
+                                        scheduled_tokens=tokens_per_req,
                                         is_prompt=False,
                                         block_id=block_id)
-        self._execute_dummy_scenario(requests, scheduled_tokens)
+            if tokens_per_req > 1:
+                spec_tokens = {req.req_id: [0] * (tokens_per_req - 1) for req in requests}
+        self._execute_dummy_scenario(requests, scheduled_tokens, spec_tokens)
 
-    def _execute_dummy_scenario(self, requests, scheduled_tokens):
+    def _execute_dummy_scenario(self, requests, scheduled_tokens, spec_tokens=None):
         from vllm.v1.core.sched.output import (SchedulerOutput, CachedRequestData)
 
         sched_output = SchedulerOutput(
@@ -6422,7 +6444,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=scheduled_tokens,
             total_num_scheduled_tokens=sum(scheduled_tokens.values()),
-            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tokens=spec_tokens or {},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=0,
             finished_req_ids=set(),
