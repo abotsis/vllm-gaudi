@@ -547,9 +547,18 @@ TPC bound. Profile of steps at 1024/2048/3200 in the next section.
 
 ## 18. Prefill profile (2026-09-14 08:28) and the KDA decay-dot fix
 
-Rank-0 torch-profiler trace of one 512-token prefill step (profiler confined
-to rank 0 without stacks; the 8-worker with-stack variant OOM-killed the
-host twice, see commit 4d7e8ecc):
+Rank-0 torch-profiler trace of one prefill step (profiler confined to rank
+0 without stacks; the 8-worker with-stack variant OOM-killed the host
+twice, see commit 4d7e8ecc). **Correction (09:20):** the profiled step was
+not the 512-token request. The worker step profiler counted engine steps
+from readiness, and the probe's calibration requests (1 and 11 sentences,
+43 and 203 tokens) come first, so the trace below is the 203-token
+calibration prefill at the 256 query bucket; the engine stopped before the
+512-token request ran. The numbers stay useful as a picture of a small
+prefill step, and the microbench per-layer figures further down are
+measured directly, but the "54% of the step" ratio compared a 512-token
+microbench against a 203-token step and is withdrawn. Commit 671cc303
+adds VLLM_PROFILE_MIN_TOKENS so a profile targets the long request.
 
 - step wall 156 ms, device union 160 ms of a 185 ms window: **86% device
   busy**. Prefill is device-bound, not host-bound.
@@ -559,8 +568,8 @@ host twice, see commit 4d7e8ecc):
 - Under HPU-graph replay all kernels belong to one recipe, so attribution
   came from a one-card microbenchmark (`tools/diag_kernel_counts.py`): one
   KDA layer's `hpu_chunk_kda` at 512 tokens = 13.5k kernels, 57.6 ms summed,
-  2.6 ms device-union; x33 layers ~ 86 ms of the step's 160 ms (54%). At 2048
-  tokens 9.7 ms/layer (320 ms of ~1000). The mHC pre is ~120 kernels per
+  2.6 ms device-union (x33 layers ~ 86 ms per 512-token step). At 2048
+  tokens 9.7 ms/layer (320 ms of ~1000 ms TTFT). The mHC pre is ~120 kernels per
   call (whole-tensor Sinkhorn), not a factor. The parallel chunk scan does
   not change device time (the loop over 8 chunks is not the cost).
 - The cost was `_decay_dot`: sum_d a_i,d b_j,d exp(ga_i,d - gb_j,d) done as a
