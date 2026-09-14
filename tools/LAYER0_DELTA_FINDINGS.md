@@ -452,3 +452,26 @@ prefill is MME-bound) and costs first-token determinism. Follow-up candidate,
 committed but untested: `VLLM_HPU_ALLREDUCE_LARGE_MODE=transpose`
 (hidden-major all-reduce; position-invariant if HCCL chunks the flat buffer
 by count; 2x memory). Test = a PBSD=4 parity boot with that env.
+
+## 15. MTP draft self-attention re-tested on the fixed tree (2026-09-13 19:05)
+
+Same recipe as §13, `VLLM_GLM_MTP_DRAFT_ATTN=1` (draft runs its own
+self-attention; this forces the eager draft because the captured draft core
+only covers the attention-bypassed path).
+
+| metric | attention off (§13) | attention on, eager draft |
+|---|---|---|
+| mean accepted length | 2.405 | **3.429** (CUDA reference 3.70) |
+| per-position acceptance | 0.82 / 0.44 / 0.13 / 0.01 | **0.91 / 0.71 / 0.48 / 0.32** |
+| aggregate throughput (agg_probe) | 20.16 tok/s | 18.15 tok/s |
+| single-stream (bench.py) | 17.26 tok/s | 12.90 tok/s |
+| greedy vs nospec | 3/8 (near-tie chars) | 3/8 (same chars) |
+| serial vs concurrent parity | 12/12 | 12/12 |
+
+The 09-10 verdict "attention on hurts acceptance" was measured with rows >= 2
+of every batch on a corrupted residual stream; with the all-reduce fix the
+draft's attention is worth +1.0 accepted token per step. What it costs today
+is the eager draft (the +46% graphed-draft win is lost). Next boot:
+`VLLM_GLM_MTP_SPLIT_GRAPH=1` (captures the tensor work around the eager
+attention). If that recovers the graphed-draft speed, attention on becomes
+the default; otherwise the draft KV wiring needs to be made graph-safe.
