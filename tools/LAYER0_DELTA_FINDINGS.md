@@ -579,3 +579,28 @@ bench) in the boot that follows.
 Still open from the sweep: the 2048 query bucket is superlinear (0.51
 ms/token vs 0.37 at 1024 and 0.29 at 3200) and the KDA share there is only
 ~30%, so another component misbehaves at exactly that shape.
+
+## 19. KDA decay-dot fix on the shipped launcher (2026-09-14 08:52)
+
+`prefill_gate.sh` with `GATES=1`, same recipe as §17, median-of-3 TTFT:
+
+| prompt tokens | TTFT before (s) | TTFT after (s) | speedup | tok/s after |
+|---|---|---|---|---|
+| 123 | 0.139 | 0.125 | 1.11x | 985 |
+| 139 | 0.166 | 0.129 | 1.29x | 1076 |
+| 251 | 0.172 | 0.137 | 1.26x | 1828 |
+| 267 | 0.244 | 0.165 | 1.48x | 1614 |
+| 507 | 0.249 | 0.168 | 1.48x | 3014 |
+| 523 | 0.378 | 0.221 | 1.71x | 2371 |
+| 1003 | 0.377 | 0.218 | 1.73x | 4590 |
+| 1035 | 1.015 | 0.332 | 3.06x | 3120 |
+| 1995 | 1.046 | 0.324 | 3.23x | 6164 |
+| 2059 | 0.931 | 0.536 | 1.74x | 3845 |
+| 3099 | 0.915 | 0.479 | 1.91x | 6476 |
+The 2048 cliff was the decay-dot's temporaries, not attention: 1035 tokens
+went from 1.015 s to 0.332 s. Gates on the same boot: rowdep 8/8 identical
+rows on both prompts and both condense cases, serial-vs-concurrent parity
+12/12, decode bench 13.9 tok/s (unchanged). Greedy vs the pre-change
+launcher capture 5/8 with divergences only at the known near-tie characters:
+the contraction order changed at the fp32-rounding level (the oracle bounds
+it at ~1e-6), which is the batch-shape class, not a defect.
