@@ -943,3 +943,13 @@ Memory is the constraint: prompt graphs for contexts up to 32k cost
 at GMU 0.35 both lost a worker in warmup). Estimated per bucket (q x
 (q + ctx) weighting): threshold 20480 tokens -> 18 graphs, ~7.5 GiB.
 Exp G3 tests that; contexts beyond 16k stay eager.
+
+Exp G3 (`PROMPT_CTX_STEP=64 GMU=0.35 PROMPT_GRAPH_MAX_TOKENS=20480`): 30
+prompt buckets, prompt graphs 13.0 GiB (the estimate was low), warmup
+274 s / 17.0 GiB. 2636 tokens 0.46 s, **7690 tokens 1.22 s (6284 tok/s,
+was 4.1-4.45)**, **22992 tokens 5.81 s (3959 tok/s, was ~11)**; chunks at
+ctx <= 128 blocks replay graphs, ctx 192 stays eager. Decode c=1 23.7,
+c=4 75 aggregate; greedy 8/8 identical to launcher_mtp4_v3. Now the
+launcher default (GMU 0.35; KV 563k tokens). `warm_client.py` also
+touches two long prompts so the draft's cache fill per ctx bucket
+compiles before users arrive (first sight of a shape: 8.6 s).

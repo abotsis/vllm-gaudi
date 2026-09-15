@@ -172,6 +172,15 @@ against 21.3 greedy (it was ~5 tok/s with the host path, which
 `VLLM_HPU_REJECTION_HOST=1` restores). Greedy output is unaffected by
 construction (it returns before this code).
 
+Long prompts (2026-09-14): prompts over 3200 tokens are chunked, and chunks
+with context used to run eager over a context padded to the model length
+(the 512-block ctx bucket clamped to 32k, and any context at all exceeded
+the prompt-graph threshold of max_num_batched_tokens): 1.5 s per chunk.
+The launcher now uses ctx buckets 0/64/128/192/256 blocks and
+`VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS=20480` (graphs for contexts up to 16k):
+7690-token prompt 4.1 -> 1.22 s, 23k-token prompt ~11 -> 5.8 s. The prompt
+graphs cost ~13 GiB, so the KV share is 0.35 (563k tokens of KV).
+
 Warmup under speculation: decode buckets are `num_reqs x (1 + num_spec)`
 lanes and are now warmed as verify batches (they used to compile on the
 first real request per shape, tens of seconds each, which read as 2 tok/s
