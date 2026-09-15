@@ -898,3 +898,13 @@ Exp B (MAXSEQ=16, DRAFT_ATTN=0) crashed on its first request:
 `take_draft_token_ids: Draft request IDs must match emitted rows`. The
 bypass draft core is not the default any more; latent bug at 16 sequences,
 not chased. Exp B2 (MAXSEQ=8, DRAFT_ATTN=0) supplies the draft-fill split.
+
+Exp B2 (MAXSEQ=8, DRAFT_ATTN=0): 2636 tokens 0.46-0.59 s, 8768 tokens
+3.61-3.74 s, 26268 tokens 12.3-13.7 s. Against attention-on (4.1-4.45 /
+12.8-13.9 s) the draft prompt-cache fill is 5-12% of long-prompt time; the
+rest is the target's chunked prefill with context: a 3200-token chunk at
+ctx 0 costs 0.45 s, every later chunk ~1.4 s. The launcher's prompt ctx
+buckets are min 0 / step 512 / max 3200 blocks, so any context up to
+65k tokens pads to 512 blocks (the model's max is 256 blocks at 32k):
+each chunk's attention runs over a 65k-key padded window. Exp C tests ctx
+buckets 0/32/64/128/256.
