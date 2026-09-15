@@ -1,0 +1,14 @@
+model_name: "zai-org/GLM-5.3-Flash"
+
+description: >
+  GLM-5.3-Flash validated for text inference on Gaudi: hybrid MLA + KDA
+  recurrent layers + routed MoE with clamped SwiGLU. Requires TP=8.
+
+test_config:
+  - modality: text
+    extra_engine_args:
+      max_model_len: 32768
+      tensor_parallel_size: 8
+    input_data_config:
+      num_prompts: 4
+      media_source: default

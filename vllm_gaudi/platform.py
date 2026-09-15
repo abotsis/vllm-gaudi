@@ -276,6 +276,27 @@ class HpuPlatform(Platform):
         # Disable multi-stream for shared experts as no Stream on CPU
         os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
+        # GLM-5.3 serving defaults. Fill ONLY values the user left unset, and
+        # only for the GLM-5.3 archs; each matches the measured production
+        # recipe (see docs/features/glm53_flash.md and the env_variables rows):
+        # - Lazy mode is required for the HPU-graph paths of this arch; eager
+        #   mode drops it onto the dynamo/hpu_backend path, which is not the
+        #   supported serving mode.
+        # - Linear bucketing with these step/max values is the bucket set the
+        #   decode/prompt warmup and the perf measurements were taken with;
+        #   different bucket sets change warmup coverage and replay behavior.
+        if (model_config is not None
+                and getattr(model_config.hf_config, "model_type", None) in ("glm5_next", "glm5_next_text")):
+            if os.environ.get("PT_HPU_LAZY_MODE") is None:
+                os.environ["PT_HPU_LAZY_MODE"] = "1"
+            if os.environ.get("VLLM_BUCKETING_STRATEGY") is None:
+                os.environ["VLLM_BUCKETING_STRATEGY"] = "lin"
+            for _k, _v in (("VLLM_DECODE_BLOCK_BUCKET_MAX", "3200"), ("VLLM_DECODE_BLOCK_BUCKET_STEP", "512"),
+                           ("VLLM_PROMPT_CTX_BUCKET_MAX", "3200"), ("VLLM_PROMPT_CTX_BUCKET_STEP", "512"),
+                           ("VLLM_PROMPT_QUERY_BUCKET_STEP", "2048"), ("VLLM_PROMPT_BS_BUCKET_MAX", "1")):
+                if os.environ.get(_k) is None:
+                    os.environ[_k] = _v
+
         # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
         # However, for HPU, speculative decoding is not supported with async scheduling.
         vllm_config.scheduler_config.async_scheduling = \
@@ -427,6 +448,15 @@ class HpuPlatform(Platform):
         # see GAUDISW-249135).
         if os.environ.get('PT_HPU_WEIGHT_SHARING') is None:
             os.environ['PT_HPU_WEIGHT_SHARING'] = '0'
+        # w12 layout for the fused MoE kernels. vLLM always packs w13
+        # concatenated as [gate rows | up rows], so "0" is the only correct
+        # value -- but the getenv default behaves like "1" (interleaved), and a
+        # mismatch is silent: no error, just wrong expert math. Safe to inherit
+        # in any mode; it selects a layout, not an execution strategy. Verified
+        # to take effect even though htorch is already imported here (the guid
+        # extractor reads it at graph-compile time, not at library load).
+        if os.environ.get('PT_HPU_GPT_MOE_WT_INTERLEAVED') is None:
+            os.environ['PT_HPU_GPT_MOE_WT_INTERLEAVED'] = '0'
         is_lazy = htorch.utils.internal.is_lazy()
         if is_lazy:
             torch._dynamo.config.disable = True

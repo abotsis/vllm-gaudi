@@ -18,7 +18,6 @@ import habana_frameworks.torch.utils.experimental as htexp
 import types
 from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -908,19 +907,26 @@ def dequant_block_fp8_weight_naive(weight,
 
     block_size_m, block_size_n = block_size
 
-    # mul scale
+    # mul scale. NB: decode fp8 via the exact LUT (fp8_to_float_safe), NOT
+    # the device .to(dtype) cast: the cast corrupts the top exponent bin
+    # (|v| >= ~256 -> inf/garbage — the HPU e4m3fn cast bug) AND eager vs
+    # compiled lowering of the cast disagree numerically, which flipped greedy
+    # tokens in compiled mode. LUT decode + fp32 scale mul is deterministic
+    # and identical under eager and torch.compile.
+    from vllm_gaudi.ops.hpu_fused_moe import fp8_to_float_safe  # local: avoids import cycle
+    wf = fp8_to_float_safe(weight)  # fp32, exact
     if weight_shape_len == 2:
         weight_scale_m, weight_scale_n = weight_scale.shape
         weight_scale = weight_scale.view(weight_scale_m, 1, weight_scale_n, 1)
-        weight = weight.view(weight_scale_m, block_size_m, weight_scale_n, block_size_n)
-        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        wf = wf.view(weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = (wf * weight_scale.float()).to(dtype)
         dequant_weight = dequant_weight.view(weight_scale_m * block_size_m, weight_scale_n * block_size_n)
         keep_first_dim = False
     elif weight_shape_len == 3:
         fd, weight_scale_m, weight_scale_n = weight_scale.shape
         weight_scale = weight_scale.view(fd, weight_scale_m, 1, weight_scale_n, 1)
-        weight = weight.view(fd, weight_scale_m, block_size_m, weight_scale_n, block_size_n)
-        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        wf = wf.view(fd, weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = (wf * weight_scale.float()).to(dtype)
         dequant_weight = dequant_weight.view(fd, weight_scale_m * block_size_m, weight_scale_n * block_size_n)
         keep_first_dim = True
     else:
@@ -931,6 +937,18 @@ def dequant_block_fp8_weight_naive(weight,
 
     return dequant_weight
 
+
+
+def restore_leading_dims(output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    """`output.view(*input.shape[:-1], -1)`, except that a 2-D caller gets
+    `output` itself. The view is a no-op reshape there, but the lazy bridge
+    still records it as a view, and a collective fed a view is executed as
+    copy-in / collective / copy-out: two kernel-less recipes plus a stranded
+    launch per site (RowParallelLinear's all-reduce after every fp8 o_proj).
+    """
+    if output.shape[:-1] == input.shape[:-1]:
+        return output
+    return output.view(*input.shape[:-1], -1)
 
 def apply_block_fp8_linear_hpu(
     input: torch.Tensor,
@@ -948,15 +966,15 @@ def apply_block_fp8_linear_hpu(
             layer.weight_scale_inv,
             bias,
         )
-        return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+        return restore_leading_dims(output.to(dtype=input.dtype), input)
     return apply_block_fp8_linear_hpu_dequant(
         input,
         layer.weight,
         block_size,
         layer.weight_scale_inv,
         bias=bias,
-        original_M=layer.orig_M,
-        original_N=layer.orig_N,
+        original_M=getattr(layer, 'orig_M_int', layer.orig_M),
+        original_N=getattr(layer, 'orig_N_int', layer.orig_N),
         do_unpad=do_unpad,
     )
 
@@ -975,14 +993,18 @@ def apply_block_fp8_linear_hpu_dequant(
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    original_M = original_M.data.item()
-    original_N = original_N.data.item()
+    # isinstance on a python value is static, so this costs dynamo nothing;
+    # the .item() path remains for callers that still pass tensors.
+    if not isinstance(original_M, int):
+        original_M = original_M.data.item()
+    if not isinstance(original_N, int):
+        original_N = original_N.data.item()
     weight = dequant_block_fp8_weight_naive(weight, weight_scale, block_size, input.dtype, original_M, original_N,
                                             do_unpad)
     output = torch.nn.functional.linear(input_2d, weight, bias=None)
     if bias is not None:
         output = output + bias
-    return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+    return restore_leading_dims(output.to(dtype=input.dtype), input)
 
 
 def apply_fp8_linear_hpu(
@@ -1104,10 +1126,19 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
         layer.get_dequant_weights_func = types.MethodType(get_dequant_weights_func, layer)
 
     layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    orig_M_val, orig_N_val = int(orig_M), int(orig_N)
     orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32, device=weight.device), requires_grad=False)
     orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32, device=weight.device), requires_grad=False)
     layer.register_parameter("orig_M", orig_M)
     layer.register_parameter("orig_N", orig_N)
+    # Plain-int copies. These are load-time constants, but the forward path
+    # recovered them with .item() on every call -- an int -> device tensor ->
+    # int round trip whose only effect is a HARD GRAPH BREAK under
+    # torch.compile (device->host sync; dynamo cannot trace through it), once
+    # per linear per layer. The Parameters stay for other consumers
+    # (attention/oot_mla.py reads layer.orig_M).
+    layer.orig_M_int = int(orig_M_val)
+    layer.orig_N_int = int(orig_N_val)
     htorch.core.mark_step()
     return layer
 
@@ -1341,6 +1372,87 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         self._cached_w2_views = None
         self._cached_w13_scale_views = None
         self._cached_w2_scale_views = None
+
+        # --- clamped SwiGLU (GLM-5.x) via the native GPT-SwiGLU lowering ---
+        # The string-activation overload's enum is terminal {silu,gelu,relu},
+        # but the bias_* overloads take the clamp as (alpha, limit) params.
+        # Set via enable_clamped_swiglu(); None keeps the stock path.
+        self.swiglu_alpha = None
+        self.swiglu_limit = None
+        self._clamp_bias12 = None
+        self._clamp_bias3 = None
+        self._clamp_d_inter = None
+
+    def enable_clamped_swiglu(self, alpha: float, limit: float, absorb_beta: bool = True):
+        """Route forward() through bias_fp8_fused_weights with a clamp.
+
+        The op computes  silu(clamp(g,max=limit)) * (clamp(u,+/-limit) + 1)
+        -- beta is hardcoded to 1. GLM needs beta=0, so bias the UP half by -1
+        (these models carry no expert bias, leaving w12_bias free): the op's
+        (clamp(u-1)+1) then reproduces clamp(u) exactly wherever the clamp does
+        not bind, and saturates one unit high where it does (~0.1-0.2% of
+        elements on real weights).
+        """
+        self.swiglu_alpha = float(alpha)
+        self.swiglu_limit = float(limit)
+        self._absorb_beta = bool(absorb_beta)
+        # Build the aux tensors NOW, not on first forward. Under HPU graphs the
+        # first forward IS the capture, and tensors created there are not valid
+        # graph inputs ("ValidateSyncInputTensors"). Registering them as module
+        # buffers at load time keeps them module-owned and capture-safe.
+        self._build_clamp_aux(torch.bfloat16)
+
+    def _build_clamp_aux(self, dtype):
+        """Bias tensors and the intermediate scale for the clamped path."""
+        w13 = self.w13_list[0].weight.squeeze()
+        w2 = self.w2_list[0].weight.squeeze()
+        two_i, hidden = w13.shape[-2], w13.shape[-1]
+        dev = w13.device
+        b12 = torch.zeros(two_i, device=dev, dtype=dtype)
+        if getattr(self, "_absorb_beta", True):
+            # PT_HPU_GPT_MOE_WT_INTERLEAVED selects the w12 layout. vLLM always
+            # packs w13 CONCATENATED as [gate rows | up rows]
+            # (routed_experts.py _load_w13 narrows w1 -> [0:I), w3 -> [I:2I)),
+            # so only "0" is correct here -- bias the UP half.
+            #
+            # Measured, because the getenv default is NOT the safe one: with the
+            # var UNSET the kernel behaves exactly as with "1" (interleaved).
+            # Probe -- zero the first half of the w13 rows and read ||out||:
+            #   unset -> 3402  (=="1": 3402)   [interleaved: gate rows survive]
+            #   "0"   -> 0.0                   [concatenated: gate == 0 kills it]
+            # Feeding concatenated weights while the kernel reads interleaved is
+            # silent: no error, just wrong math (cos +0.08 vs _silu_clamp_moe,
+            # rising to +0.96 once "0" is set). HPUPlatform.set_torch_compile()
+            # pins it to "0"; process_weights_after_loading refuses to arm if
+            # something else forced it back on.
+            if os.environ.get("PT_HPU_GPT_MOE_WT_INTERLEAVED", "0") == "1":
+                b12[1::2] = -1.0
+            else:
+                b12[two_i // 2:] = -1.0
+        b3 = torch.zeros(w2.shape[-2], device=dev, dtype=dtype)
+        # distinct tensors per expert: the MoE multiplexer registers weights
+        # per expert and aliasing one buffer across all of them leaves inputs
+        # unbound ("Empty tensor optional").
+        b12s, b3s = [], []
+        for i in range(self.num_experts):
+            n12, n3 = f"_clamp_b12_{i}", f"_clamp_b3_{i}"
+            self.register_buffer(n12, b12.clone().contiguous(), persistent=False)
+            self.register_buffer(n3, b3.clone().contiguous(), persistent=False)
+            b12s.append(getattr(self, n12))
+            b3s.append(getattr(self, n3))
+        self._clamp_bias12 = tuple(b12s)
+        self._clamp_bias3 = tuple(b3s)
+        # The clamp bounds the intermediate by silu(limit)*(limit+1), so it fits
+        # fp8 comfortably; scale to use the full e4m3 range for precision.
+        L = self.swiglu_limit
+        bound = float(torch.nn.functional.silu(torch.tensor(L)) * (L + 1.0))
+        dis = []
+        for i in range(self.num_experts):
+            n = f"_clamp_di_{i}"
+            self.register_buffer(n, torch.full((1, ), max(bound / 240.0, 1e-6), device=dev,
+                                               dtype=torch.float32).contiguous(), persistent=False)
+            dis.append(getattr(self, n))
+        self._clamp_d_inter = tuple(dis)
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)

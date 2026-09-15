@@ -76,3 +76,17 @@ def register_model():
     import vllm_gaudi.models.kimi_k25_vit  # noqa: F401
     import vllm_gaudi.models.kimi_k25  # noqa: F401
     import vllm_gaudi.models.gemma4_mm  # noqa: F401
+
+    from vllm_gaudi.models.glm5_next import HpuGlm5NextForConditionalGeneration  # noqa: F401
+    # GLM-5.3-Flash. ForCausalLM is registered so text-only checkpoints do not
+    # fall through to the CUDA-only native implementation; ForConditionalGeneration
+    # is the multimodal/VL arch name shipped for the model family.
+    ModelRegistry.register_model("Glm5NextForConditionalGeneration",
+                                 "vllm_gaudi.models.glm5_next:HpuGlm5NextForConditionalGeneration")
+    ModelRegistry.register_model("Glm5NextForCausalLM",
+                                 "vllm_gaudi.models.glm5_next:HpuGlm5NextForConditionalGeneration")
+
+    # Draft architecture after upstream SpeculativeConfig.hf_config_override rewrites
+    # model_type glm5_next (see the Glm5NextMTPModel arch special-case).
+    ModelRegistry.register_model(
+        "Glm5NextMTPModel", "vllm_gaudi.models.glm5_next_mtp:HpuGlm5NextMTPForCausalLM")

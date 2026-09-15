@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     VLLM_MINIMAX_M3_MOE_TOKEN_TILE: int = 512
     VLLM_MINIMAX_M3_MOE_DECODE_GATHER: bool = True
     VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS: int = 16
+    VLLM_HPU_MOE_IGNORE_SWIGLU_LIMIT: bool = False
+    VLLM_GLM_FUSED_CLAMP_MOE: bool = True
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
     VLLM_COMPACT_GDN: bool = False
 
@@ -83,6 +85,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_MINIMAX_M3_MOE_DECODE_GATHER", "1").lower() in ("1", "true"),
     "VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS", "16")),
+    "VLLM_HPU_MOE_IGNORE_SWIGLU_LIMIT":
+    lambda: os.environ.get("VLLM_HPU_MOE_IGNORE_SWIGLU_LIMIT", "0").strip().lower() in ("1", "true"),
+
+    # Route clamped-SwiGLU MoE through the native GPT-SwiGLU fused op
+    # (bias_fp8_fused_weights with alpha/limit) instead of the unfused
+    # dequant-in-python path. The op hardcodes beta=1, absorbed by a -1
+    # up-projection bias, which is exact except where the clamp binds.
+    #
+    # Default ON: it is worth about 2x on GLM-5.3 decode, and the unfused
+    # fallback is silent, so a default of OFF meant any context where the env
+    # var fails to propagate (notably the OpenAI server: the var is present
+    # in the api_server process and absent in EngineCore and every worker)
+    # silently served at half speed. Set to 0 to opt out.
+    "VLLM_GLM_FUSED_CLAMP_MOE":
+    lambda: os.environ.get("VLLM_GLM_FUSED_CLAMP_MOE", "1").strip().lower() in ("1", "true"),
 
     # Run multimodal warmup outside PT_COMPILE_ONLY_MODE for models with
     # data-dependent output shapes that must be materialized during warmup.

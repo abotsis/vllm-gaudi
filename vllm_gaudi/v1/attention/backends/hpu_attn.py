@@ -65,6 +65,12 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     mamba_chunks_to_block_mapping: Optional[torch.Tensor] = None
     seqlens_offsets_for_blocks: Optional[torch.Tensor] = None
     window_block_list: Optional[torch.Tensor] = None
+    # Speculative decode: accepted-token count per sequence from the PREVIOUS
+    # step. The linear-attention layer resumes its recurrent state from
+    # candidate slot num_accepted-1 and the conv cache rewinds by the same
+    # offset. Must also be listed in the model runner's `subtuple` whitelist,
+    # or it is silently trimmed off before the model sees it.
+    num_accepted_tokens: Optional[torch.Tensor] = None
 
     def seq_len(self):
         return self.slot_mapping.size(-1)
@@ -135,7 +141,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              load_indices_tensor=None,
                              store_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             num_accepted_tokens=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -158,4 +165,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   num_accepted_tokens=num_accepted_tokens)

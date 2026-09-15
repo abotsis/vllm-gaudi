@@ -1,0 +1,225 @@
+# GLM-5.3-Flash (glm5_next) on HPU
+
+Support for the GLM-5.3-Flash model family on Intel Gaudi accelerators: a hybrid
+decoder mixing multi-head latent attention (MLA), gated delta net / KDA
+recurrent layers, and a routed mixture-of-experts block with a **clamped SwiGLU**
+activation, plus MTP (multi-token prediction) speculative decoding.
+
+Launch example (TP=8):
+
+```bash
+vllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 8 --port 8000
+```
+
+MTP speculative decoding (the draft head ships inside the checkpoint as layer
+`n_layers + 1`; no separate draft model is downloaded):
+
+```bash
+vllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 8 \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 4}'
+```
+
+## What is reused from upstream vLLM, and why the rest is plugin-local
+
+GLM-5.3-Flash support was merged into vLLM itself (vllm#53906). That
+implementation only ships NVIDIA/AMD compute kernels; the platform dispatch at
+`vllm/models/glm5next` has no HPU backend. The vllm-gaudi plugin therefore
+carries its own model implementation, deliberately reusing every upstream piece
+that is platform-neutral:
+
+| Piece | Source | Status on HPU |
+|---|---|---|
+| `Glm5NextConfig` / config plumbing, `hf_config_override` MTP rewrite | upstream vLLM | reused as-is |
+| KDA state shapes/dtypes/copy funcs (`MambaStateShapeCalculator.kda_state_shape`, `kda_state_dtype`, `gated_delta_net_state_copy_func`) | upstream vLLM `mamba_utils` | reused as-is |
+| `GatedDeltaNetAttention` scaffolding (conv/state/norm interfaces) | upstream vLLM `mamba/gdn` | interfaces reused; state stepping replaced |
+| KV-cache group machinery, `MambaSpec`, hybrid cache manager | upstream vLLM + vllm-gaudi | reused as-is |
+| Un-fused `swigluoai` expert activation (`_unfused_swigluoai_moe` with `alpha`/`beta`/`limit`) | upstream vllm-gaudi (MiniMax-M3 path) | reused as-is; bit-identical to the fused path below |
+| Fused clamped-SwiGLU MoE (`VLLM_GLM_FUSED_CLAMP_MOE`, default on) | vllm-gaudi plugin | HPU-only — Synapse's fused-MoE activation enum ends at `{silu, gelu, relu}` and cannot represent the clamp |
+
+### Why a custom KDA
+
+The upstream KDA compute stack (`vllm/models/glm5next/nvidia/kda.py`,
+`nvidia/ops/third_party/kda/*`, the vendored flash-linear-attention ops) is
+Triton/CuteDSL CUDA code. There is no pure-torch reference implementation
+upstream to fall back to, the kernel attachment is unconditional at layer
+construction, and HPU is not a considered target anywhere in that path
+(only XPU is explicitly rejected; CUDA/ROCm are selected otherwise). Building
+the model class from upstream would re-implement every construction subtree it
+needs overridden. The plugin instead:
+
+1. keeps the upstream structural contracts (state shapes, dtypes, copy
+   functions, `MambaBase` registration, KV-cache groups) so a future upstream
+   platform dispatch can absorb the HPU kernels directly;
+2. owns only the compute layer: `vllm_gaudi/ops/hpu_kda_eager.py` (reference
+   chunk/recurrent kernels), `vllm_gaudi/ops/hpu_kda_pytorch.py` (fast chunk
+   kernel), and the state-slot management for speculative decoding (per-request
+   private candidate slots appended to the recurrent-state pool, addressed by
+   ids that stay stable across batch condense and swap operations).
+
+Attention is plain NoPE MLA (`qk_rope_head_dim == 0`): no indexer, no rope. The
+HPU path guards the zero-width rope cases (`oot_mla.py`,
+`attention/backends/hpu_attn.py`), which upstream never exercises.
+
+## Serving recipe (how to launch)
+
+A minimal launch that reaches the measured throughput:
+
+```bash
+VLLM_USE_V1=1 vllm serve /path/to/GLM-5.3-Flash \
+    --served-model-name glm-5.3-flash \
+    --tensor-parallel-size 8 --enable-expert-parallel --enable-ep-weight-filter \
+    --max-model-len 32768 --max-num-seqs 8 --max-num-batched-tokens 8192 \
+    --gpu-memory-utilization 0.50 \
+    --enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47 \
+    --chat-template /path/to/GLM-5.3-Flash/chat_template.enable-thinking-switch.jinja \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":4}'   # optional
+```
+
+What the launcher must set (before `vllm` starts) vs.
+what the plugin supplies automatically:
+
+**Environment the launcher itself must export** — the Synapse backend reads
+these at torch-import/backend-load time, before any plugin default can fire:
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `PT_HPU_LAZY_MODE` | `1` | HPU graphs (lazy) are the supported serving mode; a partial/eager activation produced oversized KV pools (about 2x the correct size) and replay-scratch allocation deaths on the dev host |
+| `PT_HPU_MEMORY_POOL` | `none` | validated-recipe value (Synapse-side pool off) |
+| `PT_HPU_LAZY_ACC_PAR_MODE` | `1` | validated-recipe value (accumulation-parallel lazy mode) |
+
+Then everything below is supplied automatically (any explicit user value wins):
+
+| fused clamped-SwiGLU MoE (`VLLM_GLM_FUSED_CLAMP_MOE`) | **auto** (default on since it is worth ~2x on GLM-5.3 decode) | unfused fallback is silent; default-on avoids half-speed surprises when the var fails to propagate |
+| `PT_HPU_GPT_MOE_WT_INTERLEAVED=0` | **auto** (all archs, `if unset`) | the wrapper's unset behavior is the interleaved layout while vLLM packs `w13` concatenated; pinning the layout prevents silently wrong expert math and lets the fused arm arm itself (read at graph-compile time, so a plugin-time pin suffices) |
+| bucketing (lin, decode-block 2048→3200/512, prompt-ctx 3200/512, prompt-query 2048, prompt-bs 1) | **auto** for `glm5_next` (plugin default, `if unset`) | this is the bucket set the warmup coverage and perf measurements were taken with |
+| `VLLM_COMPACT_GDN` | upstream default (`0`) is correct for GLM | KDA is not supported under the compact GDN path |
+| `--enable-expert-parallel --enable-ep-weight-filter` | user-supplied CLI | MoE weight split across TP ranks and the weight-filter pass are load decisions, not plugin defaults |
+| `--block-size 128` | **auto** (plugin default) | vLLM-gaudi sets the Gaudi page size to 128 tokens when the user does not specify one |
+| `PT_HPU_WEIGHT_SHARING=0`, `PT_HPU_ENABLE_LAZY_COLLECTIVES=true` | **auto** (all archs, `if unset`) | required for multi-rank HPU-graph serving; set by the plugin at import |
+
+Any value the user sets explicitly wins over every plugin default.
+
+## Speculative decoding notes
+
+- The draft head is not loaded twice: `HpuEagleProposer.load_model` binds the
+  target's already-loaded MTP block (saves a second full pass over the
+  checkpoint and a duplicate of the layer weights per rank).
+- The draft head runs as its own HPU graph (`VLLM_GLM_MTP_DRAFT_GRAPH=0`
+  disables capture; drafting then runs the draft head eagerly).
+- Prefill batches that do not produce logits (intermediate chunks of a chunked
+  or mamba-block-aligned prefill) produce no draft tokens themselves; drafts
+  are paired with the batch that produced the logits.
+
+## Determinism under concurrency
+
+Two separate effects make a co-batched request's greedy output differ from
+the same request served alone. They were separated on 2026-09-13 with
+`tools/diag_window.sh` (see `tools/LAYER0_DELTA_FINDINGS.md`):
+
+1. **All-reduce row order (a bug, fixed by default).** HCCL's all-reduce sums
+   each chunk of the `[bs, hidden]` buffer in a chunk-dependent rank order.
+   At decode a chunk is one row, so a row's residual stream after `o_proj`
+   and the MoE down-projection depended on its position in the batch by
+   about one bf16 ULP. GLM-5.3 keeps that ULP in the KDA recurrent state of
+   every layer after the first, and expert routing at near-ties turns it into
+   different tokens: eight identical prompts decoded together produced seven
+   different texts. `VLLM_HPU_ALLREDUCE_MODE=gather_sum` (default) all-gathers
+   the partials and sums them in rank order in fp32, which is position
+   independent; with it the eight prompts produce one text. No measurable
+   decode cost (single-stream 14.7 vs 13.6 tok/s, within restart noise).
+   Buffers above `VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES` (16 MiB) fall back to
+   `hccl`, because every all-reduce site inside a captured prefill graph
+   retains its working buffers. `hccl` restores the old behaviour.
+2. **Batch-shape numerics (inherent).** A lone decode runs the bs=1 recipe, a
+   full batch the bs=8 one; GEMM and attention kernels round differently at
+   different shapes, exactly as on other accelerators. With gather_sum alone,
+   serial vs concurrent greedy parity on the 12-prompt probe was 7/12 on the
+   default bucket ladder. For bit-exact parity pin every decode to one
+   recipe: `VLLM_DECODE_BS_BUCKET_MIN=8 VLLM_DECODE_BS_BUCKET_STEP=8
+   VLLM_DECODE_BLOCK_BUCKET_MIN=32` (and `VLLM_PROMPT_BS_BUCKET_MIN` equal to
+   the prompt bucket max when co-batched prefill is on): 12/12 identical.
+   Measured single-stream: 15.0 tok/s pinned at 8 sequences, 14.0 pinned at
+   32, vs 13.6-14.7 on the default ladder, all within restart noise (decode
+   is host-launch-bound; padded rows are free), and warmup drops from ~13 to
+   ~2 minutes because there is one decode bucket. The reference launcher
+   (`glm53_serve.sh`) ships this recipe; `DECODE_LADDER=1` restores the ladder.
+3. **Co-batched prefill (inherent at the current cap).** With
+   `VLLM_PROMPT_BS_BUCKET_MAX>1` a prefill of four prompts at the smallest
+   bucket is already 512 tokens, above the 16 MiB working-buffer cap, so those
+   all-reduces take the position-dependent path and a prompt's first tokens
+   depend on where it sat in the prefill batch (parity 9/12, first-token
+   flips). Co-batched prefill bought ~5-12% aggregate prefill throughput, so
+   the launcher defaults to one prompt per prefill forward.
+   `VLLM_HPU_ALLREDUCE_LARGE_MODE=transpose` (hidden-major all-reduce, 2x
+   working memory) is the untested candidate for having both.
+
+MTP note (2026-09-14): the draft's own self-attention is on by default and
+runs inside one HPU graph per draft step (`VLLM_GLM_MTP_DRAFT_ATTN=1`,
+`VLLM_GLM_MTP_ATTN_GRAPH=1`, both default). The attention metadata tensors
+are graph inputs and are swapped onto the forward context inside the
+captured forward, so replays read fresh block tables. Measured on the
+launcher at MTP-4: mean accepted length 3.33 (bypass 2.41), aggregate
+26.0 tok/s (bypass 20.2), single-stream 20.9 tok/s (bypass 17.3), greedy
+identical to the eager/split attention paths, serial-vs-concurrent parity
+12/12. The earlier bypass verdict dated from the all-reduce row corruption.
+`VLLM_GLM_MTP_DRAFT_ATTN=0` restores the bypass; `VLLM_GLM_MTP_ATTN_GRAPH=0`
+the split/eager paths.
+
+Sampling under speculation (2026-09-14): the non-greedy rejection-sampling
+math (temperature, top-k, top-p, softmax, recovery) runs on the device in a
+materialised segment; single-stream decode at T=0.7/top_p 0.9 is 19.7 tok/s
+against 21.3 greedy (it was ~5 tok/s with the host path, which
+`VLLM_HPU_REJECTION_HOST=1` restores). Greedy output is unaffected by
+construction (it returns before this code).
+
+Long prompts (2026-09-14): prompts over 3200 tokens are chunked, and chunks
+with context used to run eager over a context padded to the model length
+(the 512-block ctx bucket clamped to 32k, and any context at all exceeded
+the prompt-graph threshold of max_num_batched_tokens): 1.5 s per chunk.
+The launcher now uses ctx buckets 0/64/128/192/256 blocks and
+`VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS=20480` (graphs for contexts up to 16k):
+7690-token prompt 4.1 -> 1.22 s, 23k-token prompt ~11 -> 5.8 s. The prompt
+graphs cost ~13 GiB, so the KV share is 0.35 (563k tokens of KV).
+
+Warmup under speculation: decode buckets are `num_reqs x (1 + num_spec)`
+lanes and are now warmed as verify batches (they used to compile on the
+first real request per shape, tens of seconds each, which read as 2 tok/s
+in a session that crossed three block buckets). The draft itself is still
+skipped by warmup, so its prompt-cache fill (per prompt bucket) and its
+attention graph (per decode shape) compile on first use, 2-8 s each; the
+bench launcher runs a warm client after /health to pay those before users
+do.
+
+Tools: `tools/diag_window_driver.py rowdep` (identical prompts must give
+identical rows), `ROLE=parity`, `ROLE=logits`, `ROLE=state`, `ROLE=capture`.
+
+## Performance notes on this port
+
+- Prefill (2026-09-14): the KDA chunk kernel's intra-chunk decay dot runs as
+  blocked MME matmuls instead of per-tile elementwise products (see
+  `_decay_dot` in `ops/hpu_kda_pytorch.py`). TTFT on the shipped launcher:
+  507 tokens 0.249 -> 0.168 s, 1003 tokens 0.377 -> 0.218 s, 1995 tokens
+  1.046 -> 0.324 s, 3099 tokens 0.915 -> 0.479 s (6.5k tok/s). Prefill is
+  device-bound on small fp32 TPC kernels, not on the MME; attention and the
+  mHC mixing are minor at every bucket. Prompt-query buckets are
+  128/256/512/1024/2048/3200: a prompt just over an edge pays the next
+  bucket (30-50% TTFT), so size `VLLM_PROMPT_QUERY_BUCKET_*` to the workload.
+- `VLLM_KDA_SCAN=parallel` (the bench launcher's default since 2026-09-14)
+  runs the chunk recurrence as a prefix scan: 7% TTFT at the 3200 bucket,
+  neutral below, greedy/rowdep/parity clean. The forward wall is ~80 ms
+  plus ~0.1 ms/token: an 80 ms floor of per-layer graph launches (the
+  same floor as a decode step) and compiler-sliced small kernels above
+  it. Rewriting the mHC Sinkhorn or the KDA chunk length at the op level
+  did not move it (findings doc §20).
+
+- `VLLM_HPU_DECODE_TENSOR_CACHE` keeps the HPU-graph tensor cache for decode
+  graphs; on for `glm5_next` without speculative decoding, off under it
+  (the doubled graph count exceeds host memory at TP=8).
+- `VLLM_HPU_GRAPH_ASYNC_REPLAY=1` replays captured graphs asynchronously.
+- The per-DecoderLayer `mark_step` hook is skipped under HPU-graph replay for
+  `glm5_next` (each replayed boundary costs host time per decode step);
+  `VLLM_CONFIG_HIDDEN_LAYERS` set explicitly restores it.
+- FP8 linears hand the all-reduce contiguous tensors (no views) and do not
+  round-trip `orig_M`/`orig_N` through the device.
+
+See `docs/configuration/env_variables.md` for the environment variables.
