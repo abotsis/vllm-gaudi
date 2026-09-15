@@ -908,3 +908,12 @@ buckets are min 0 / step 512 / max 3200 blocks, so any context up to
 65k tokens pads to 512 blocks (the model's max is 256 blocks at 32k):
 each chunk's attention runs over a 65k-key padded window. Exp C tests ctx
 buckets 0/32/64/128/256.
+
+Exp C2 (`PROMPT_CTX_MIN=0 STEP=32 MAX=256`, launcher now honours the
+overrides; a nonzero MIN drops the zero-context fast path and must not be
+used): 54 prompt graphs, warmup 345 s / 8.2 GiB. 2636 tokens 0.46 s, 8768
+tokens 3.44 s (first sight 11.5 s: the draft prompt-cache fill compiles
+per new (query, ctx) shape), 26268 tokens 12.27 s; decode c=1 22.1 tok/s,
+c=4 76 tok/s aggregate. Better than the 512-block padding (4.1 / 12.8 s)
+but every chunk after the first still costs ~1.5 s at either setting, so
+padding is not the main term. Exp D reads the per-step token counts.
