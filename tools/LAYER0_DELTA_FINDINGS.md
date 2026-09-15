@@ -872,3 +872,29 @@ Launcher gate (run `launcher_mtp4_devsampler`, `bench_sampled.py` added to
 the gate): greedy 8/8 identical to launcher_mtp4_v3, parity 12/12,
 acceptance 3.33, aggregate 26.45 tok/s, greedy single-stream 21.3 tok/s,
 **sampled single-stream (T=0.7, top_p 0.9) 19.7 tok/s** (was ~5).
+
+## 24. Concurrency under speculation and long prompts (2026-09-14 18:20-19:10)
+
+Exp A (`run_expAB.sh`): NSPEC=4 MAXSEQ=16 GMU=0.35 (the 80-lane decode
+graph set is 15.7 GiB, so the KV cache share had to drop from 0.50; at
+0.50 the first decode capture killed the worker with 14 GiB free).
+Greedy, 200 tokens per stream:
+
+| streams | aggregate tok/s | per-stream median | TTFT max |
+|---|---|---|---|
+| 1 | 15.5 | 15.7 | 0.20 s |
+| 4 | 56.0 | 15.2 | 1.19 s |
+| 8 | 106.7 | 16.2 | 1.83 s |
+| 16 | 185.9 | 15.7 | 3.07 s |
+
+Near-linear to 16 streams. The cost is single-stream: every step pads to
+80 lanes, 15.7 vs 21 tok/s at MAXSEQ=8. Long prompts on the same boot:
+8768 tokens 4.1-4.45 s (~2000 tok/s), 26268 tokens 12.8-13.9 s (~1950
+tok/s), second rep no faster than the first (no compile penalty). A 3200-
+token chunk inside a long prompt therefore costs ~1.4 s against 0.45 s for
+a fresh 3200-token prompt.
+
+Exp B (MAXSEQ=16, DRAFT_ATTN=0) crashed on its first request:
+`take_draft_token_ids: Draft request IDs must match emitted rows`. The
+bypass draft core is not the default any more; latent bug at 16 sequences,
+not chased. Exp B2 (MAXSEQ=8, DRAFT_ATTN=0) supplies the draft-fill split.
