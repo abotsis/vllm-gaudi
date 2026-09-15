@@ -917,3 +917,29 @@ per new (query, ctx) shape), 26268 tokens 12.27 s; decode c=1 22.1 tok/s,
 c=4 76 tok/s aggregate. Better than the 512-block padding (4.1 / 12.8 s)
 but every chunk after the first still costs ~1.5 s at either setting, so
 padding is not the main term. Exp D reads the per-step token counts.
+
+## 25. Long prompts: chunks with context ran EAGER (2026-09-14 19:40-21:10)
+
+`VLLM_DEBUG=steps` on a 7690-token prompt (chunks 3200/3200/1290): the
+ctx-0 chunk takes 368 ms, the second 1423 ms, the third (1290 tokens at
+6400 context) 1556 ms. The high-level profiler names the forwards
+`model_forward_bs1_seq3200_ctx231_graphsF`: chunks with context run
+without HPU graphs. Two causes, both in the recipe/runner:
+
+- The prompt ctx bucket 512 (blocks) is clamped to the model length by the
+  bucket corrector: 231 blocks for a 3200-token chunk, 240 for 2048
+  (32768 - query, in 128-token blocks). So every chunk with any context
+  attends over a ~30k-key padded window.
+- `_use_graphs` skips graphs when query + num_blocks x block_size exceeds
+  `max_cudagraph_capture_size`, which defaults to max_num_batched_tokens
+  (3200): any context at all disqualifies the prompt from graphs. Eager
+  lazy-mode execution of a 45-layer chunk is the 1.5 s.
+
+Fixes: `VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS` (runner) sets that threshold; the
+launcher's ctx buckets become 0/64/128/192/256 blocks (PROMPT_CTX_STEP,
+max = MAXLEN/128) and the threshold is set from PROMPT_GRAPH_MAX_TOKENS.
+Memory is the constraint: prompt graphs for contexts up to 32k cost
+22.2 GiB for 30 buckets (exp G with 54 buckets at GMU 0.5 and G2 with 30
+at GMU 0.35 both lost a worker in warmup). Estimated per bucket (q x
+(q + ctx) weighting): threshold 20480 tokens -> 18 graphs, ~7.5 GiB.
+Exp G3 tests that; contexts beyond 16k stay eager.
