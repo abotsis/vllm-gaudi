@@ -953,3 +953,19 @@ c=4 75 aggregate; greedy 8/8 identical to launcher_mtp4_v3. Now the
 launcher default (GMU 0.35; KV 563k tokens). `warm_client.py` also
 touches two long prompts so the draft's cache fill per ctx bucket
 compiles before users arrive (first sight of a shape: 8.6 s).
+
+## 26. Speculation depth sweep (2026-09-15 03:24-04:20)
+
+`launcher_gate.sh` per depth on the current recipe (ctx graphs, GMU 0.35),
+greedy compare against launcher_mtp4_v3:
+
+| NSPEC | accepted len | aggregate tok/s | greedy 1-stream | sampled 1-stream (T=0.7, p=0.9) | parity |
+|---|---|---|---|---|---|
+| 3 | 3.08 | 25.6 | 20.7 | 18.7 | 12/12 |
+| **4** | 3.33 | **26.3** | 20.7 | **19.65** | 12/12 |
+| 5 | 3.43 | 23.9 | 18.8 | 19.0 | 12/12 |
+
+Depth 4 stays. Depth 5 gains 0.1 accepted token but the 48-lane verify
+step costs more than it returns; depth 3 saves nothing single-stream and
+loses aggregate. Greedy 5/8 for 3 and 5 vs the depth-4 reference is the
+verify-shape near-tie effect, not an error.
