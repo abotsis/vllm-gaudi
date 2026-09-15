@@ -1604,6 +1604,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.max_cudagraph_capture_size = self.vllm_config.compilation_config.max_cudagraph_capture_size
         if self.max_cudagraph_capture_size is None:
             self.max_cudagraph_capture_size = self.max_num_batched_tokens
+        # VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: prompt forwards whose padded
+        # query + context exceeds this run eager (the default, max_num_batched_
+        # tokens, means ANY chunked-prefill step with context runs eager: on
+        # GLM-5.3 a 3200-token chunk with context took 1.5 s eager vs 0.34 s
+        # as a graph). Set it to max_model_len to capture graphs for every
+        # warmed prompt bucket; the ctx bucket range bounds the graph memory.
+        _pg = os.environ.get("VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS")
+        if _pg:
+            self.max_cudagraph_capture_size = int(_pg)
         self.use_prefix_caching = (self.vllm_config.cache_config.enable_prefix_caching)
         self.bucketing_manager = HPUBucketingManager()
         max_num_prefill_seqs = self.max_num_seqs if self.use_merged_prefill \
@@ -3864,7 +3873,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         phase = "prompt" if attn_metadata.is_prompt else "decode"
         cfg = (phase, batch_size, seq_len, num_blocks)
         if self.debug_fwd:
-            self.debug_fwd(cfg)
+            self.debug_fwd(f"{cfg} block_size={self.block_size} attn_block_size={self.attn_block_size} "
+                           f"md.block_size={getattr(attn_metadata, 'block_size', None)} "
+                           f"use_graphs={self._use_graphs(attn_metadata, batch_size)} "
+                           f"graph_threshold={self.max_cudagraph_capture_size}")
         seen = cfg in self.seen_configs
         self.seen_configs.add(cfg)
         if not seen and not warmup_mode:
