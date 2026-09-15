@@ -171,6 +171,12 @@ def test_warmup_range_with_one():
     assert result == [1, 2, 4, 8, 16, 32, 64, 128]
 
 
+def test_warmup_range_includes_off_grid_max():
+    # max not on the step grid is still a bucket (GLM-5.3: 128/2048/3200)
+    assert linear.warmup_range((128, 2048, 3200)) == [128, 256, 512, 1024, 2048, 3200]
+    assert linear.warmup_range((128, 512, 3200)) == [128, 256, 512, 1024, 1536, 2048, 2560, 3072, 3200]
+
+
 def test_generate_prompt_buckets():
     max_num_batched_tokens = 2048
     block_size = 64

@@ -1527,6 +1527,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.max_cudagraph_capture_size = self.vllm_config.compilation_config.max_cudagraph_capture_size
         if self.max_cudagraph_capture_size is None:
             self.max_cudagraph_capture_size = self.max_num_batched_tokens
+        # VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS: prompt forwards whose padded
+        # query + context exceeds this run eager (the default, max_num_batched_
+        # tokens, means ANY chunked-prefill step with context runs eager: on
+        # GLM-5.3 a 3200-token chunk with context took 1.5 s eager vs 0.34 s
+        # as a graph). Set it to max_model_len to capture graphs for every
+        # warmed prompt bucket; the ctx bucket range bounds the graph memory.
+        _pg = os.environ.get("VLLM_HPU_PROMPT_GRAPH_MAX_TOKENS")
+        if _pg:
+            self.max_cudagraph_capture_size = int(_pg)
         self.use_prefix_caching = (self.vllm_config.cache_config.enable_prefix_caching)
         self.bucketing_manager = HPUBucketingManager()
         max_num_prefill_seqs = self.max_num_seqs if self.use_merged_prefill \
@@ -3647,7 +3656,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         phase = "prompt" if attn_metadata.is_prompt else "decode"
         cfg = (phase, batch_size, seq_len, num_blocks)
         if self.debug_fwd:
-            self.debug_fwd(cfg)
+            self.debug_fwd(f"{cfg} block_size={self.block_size} attn_block_size={self.attn_block_size} "
+                           f"md.block_size={getattr(attn_metadata, 'block_size', None)} "
+                           f"use_graphs={self._use_graphs(attn_metadata, batch_size)} "
+                           f"graph_threshold={self.max_cudagraph_capture_size}")
         seen = cfg in self.seen_configs
         self.seen_configs.add(cfg)
         if not seen and not warmup_mode:
@@ -3807,11 +3819,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logprobs = self.sampler.compute_logprobs(logits)
             gathered = self._gather_prompt_logprobs_hpu(logprobs, num_prompt_logprobs, tgt_token_ids)
 
-            # Transfer HPU->CPU async.
+            # Transfer HPU->CPU. Blocking on purpose: the destination is a plain
+            # CPU tensor the engine reads right after execute_model returns, and
+            # nothing between here and there synchronizes the device. An async
+            # copy that has not landed yet is read as stale zeros/garbage.
             chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(gathered.logprob_token_ids, non_blocking=True)
-            logprobs_tensors.logprobs[chunk_slice].copy_(gathered.logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(gathered.selected_token_ranks, non_blocking=True)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(gathered.logprob_token_ids, non_blocking=False)
+            logprobs_tensors.logprobs[chunk_slice].copy_(gathered.logprobs, non_blocking=False)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(gathered.selected_token_ranks, non_blocking=False)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
@@ -3839,7 +3854,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         token_logprobs = logprobs.gather(-1, token_ids)
         token_ranks = (logprobs >= token_logprobs).sum(-1)
 
-        indices = torch.cat((token_ids, topk_indices), dim=1).to(torch.int32)
+        # int64 on purpose: see _hpu_gather_logprobs in vllm_gaudi/patches.py for
+        # the first-execution corruption of the cat->int32 narrowing on HPU.
+        indices = torch.cat((token_ids, topk_indices), dim=1)
         combined_logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
 
         return LogprobsTensors(indices, combined_logprobs, token_ranks)
@@ -4027,12 +4044,40 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       pad_to: Optional[int] = None,
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
         htorch.core.mark_step()
-        # Async scheduling: repair -1 placeholders before penalties read them.
-        self.input_batch.update_async_output_token_ids()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
+        capture = self._diag_sampler_before(logits_device, sampling_metadata, request_ids, logits_requests, pad_to)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         htorch.core.mark_step()
-        return sampler_output, sampling_metadata
+        self._diag_sampler_after(capture, sampler_output)
+        return self._own_sampled_logprobs(sampler_output), sampling_metadata
+
+    def _own_sampled_logprobs(self, sampler_output):
+        """Hand retention code host-owned logprob tensors.
+
+        sample_tokens keeps ``sampler_output.logprobs_tensors`` from every
+        sampler call of a step (each prefill segment, then decode) and only
+        converts them in _build_logprobs_output after the last call. Those are
+        lazy HPU tensors; keeping them alive across further sampler calls (and,
+        under async scheduling, into the next step) is a lifetime hazard, and
+        the serving-side symptoms matched one: top_logprobs rows whose token
+        ids and values disagree (duplicated values, a chosen token listed below
+        a higher one, -inf -> -9999 for the chosen token). Copy once, blocking,
+        while the producing step is still current: [rows, k+1] ints and floats,
+        and only when logprobs were requested. The spec path already does the
+        same before parse_output.
+        """
+        lp = getattr(sampler_output, "logprobs_tensors", None)
+        if lp is None or lp.logprob_token_ids.device.type == "cpu":
+            return sampler_output
+        cu_tensor = lp.cu_num_generated_tokens_tensor
+        sampler_output.logprobs_tensors = LogprobsTensors(
+            lp.logprob_token_ids.to(device="cpu", non_blocking=False, copy=True),
+            lp.logprobs.to(device="cpu", non_blocking=False, copy=True),
+            lp.selected_token_ranks.to(device="cpu", non_blocking=False, copy=True),
+            lp.cu_num_generated_tokens,
+            None if cu_tensor is None else cu_tensor.to(device="cpu", non_blocking=False, copy=True),
+        )
+        return sampler_output
 
     def _pool(
         self,
@@ -5666,6 +5711,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def _prepare_dummy_scenario(self, prompt_cfg, decode_cfg):
         requests: list[NewRequestData] = []
         scheduled_tokens: dict[str, int] = {}
+        spec_tokens: dict[str, list[int]] = {}
 
         if prompt_cfg:
             prompt_bs, prompt_query_len, prompt_num_blocks = prompt_cfg
@@ -5708,6 +5754,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                             is_prompt=True)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
+            # Spec-decode buckets inflate bs to num_reqs * (1 + num_spec_tokens)
+            # (8 seqs x 5 = 40 lanes for MTP-4) while input_batch has
+            # max_num_reqs slots. Build those buckets the way the verify step
+            # runs them: num_reqs requests, each scheduled 1 + num_spec tokens
+            # with num_spec dummy draft ids. Before this they were skipped and
+            # compiled on the first real request per (bs, blocks) shape --
+            # tens of seconds each, measured as ~2 tok/s for a user session
+            # that crossed three block buckets. Shapes that still cannot be
+            # expressed fall back to the capped one-token batch.
+            num_spec = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+            spec_lanes = 1 + num_spec
+            if (num_spec and decode_bs > self.max_num_reqs and decode_bs % spec_lanes == 0
+                    and decode_bs // spec_lanes <= self.max_num_reqs):
+                capped_decode_bs = decode_bs // spec_lanes
+                tokens_per_req = spec_lanes
+            else:
+                capped_decode_bs = min(decode_bs, self.max_num_reqs)
+                tokens_per_req = 1
             # Use attn_block_size (the actual kernel block granularity used in
             # _create_decode_input_data) rather than block_size (the KV-manager
             # page size).  For hybrid models these differ after
@@ -5725,12 +5789,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     min_tokens_per_seq = sw_blocks * decode_block_size
                 else:
                     min_tokens_per_seq = decode_block_size
-                decode_seq_lengths = [min_tokens_per_seq] * decode_bs
+                decode_seq_lengths = [min_tokens_per_seq] * capped_decode_bs
                 # Cap block_id at physical pool — contiguous PA uses
                 # block_id as the allocation base which must be valid.
                 block_id = min(decode_num_blocks - 1, self.kv_cache_config.num_blocks - 1)
             else:
-                decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, decode_block_size)
+                # Under speculation every lane of a request carries the
+                # request's block table, so the bucket's block count is
+                # num_reqs x lanes x blocks_per_req: size the dummy sequences
+                # from num_blocks / lanes or the run lands on a larger bucket
+                # (8 reqs x 16 blocks x 5 lanes = 640, not 128).
+                dummy_blocks = max(capped_decode_bs, decode_num_blocks // tokens_per_req)
+                decode_seq_lengths = self._generate_seq_lengths(capped_decode_bs, dummy_blocks, decode_block_size)
                 block_id = 0
 
             for dsl in decode_seq_lengths:
@@ -5738,12 +5808,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                         scheduled_tokens,
                                         num_computed_tokens=dsl,
                                         total_tokens=dsl,
-                                        scheduled_tokens=1,
+                                        scheduled_tokens=tokens_per_req,
                                         is_prompt=False,
                                         block_id=block_id)
-        self._execute_dummy_scenario(requests, scheduled_tokens)
+            if tokens_per_req > 1:
+                spec_tokens = {req.req_id: [0] * (tokens_per_req - 1) for req in requests}
+        self._execute_dummy_scenario(requests, scheduled_tokens, spec_tokens)
 
-    def _execute_dummy_scenario(self, requests, scheduled_tokens):
+    def _execute_dummy_scenario(self, requests, scheduled_tokens, spec_tokens=None):
         from vllm.v1.core.sched.output import (SchedulerOutput, CachedRequestData)
 
         sched_output = SchedulerOutput(
@@ -5751,7 +5823,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=scheduled_tokens,
             total_num_scheduled_tokens=sum(scheduled_tokens.values()),
-            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tokens=spec_tokens or {},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=0,
             finished_req_ids=set(),
@@ -7281,10 +7353,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             target_hidden_states = torch.cat(aux_hidden_states, dim=-1)
         else:
             target_hidden_states = hidden_states
-        next_token_ids = prefill_sampled_token_ids_tensor[idx]
+        next_token_ids = prefill_sampled_token_ids_tensor[sampled_idx]
+        if mtp_prompt_batch is not None:
+            # One whole rectangular first forward also fills intermediate rows.
+            # Only finishing rows contribute logits and later draft iterations.
+            target_token_ids = mtp_prompt_batch["token_ids"].clone()
+            finishing = mtp_prompt_batch["finishing"]
+            next_token_ids = next_token_ids.reshape(-1)
+            if next_token_ids.numel() < len(finishing):
+                raise ValueError("MTP sampled tokens are missing finishing rows")
+            last_indices = []
+            for sample_row, req_id in enumerate(finishing):
+                row, computed, query, prompt = mtp_prompt_batch["rows"][req_id]
+                target_token_ids[row, query - 1] = next_token_ids[sample_row]
+                last_indices.append(row * token_ids.shape[1] + query - 1)
+            last_token_indices = async_h2d_copy(last_indices, device=token_ids.device, dtype=torch.int64)
+            req_indices = [self.input_batch.req_id_to_index[rid] for rid in finishing]
+            prefill_batch_block_table = block_table_cpu_tensor[req_indices]
+            target_hidden_states = target_hidden_states.reshape(*token_ids.shape, -1)
+            return self.drafter.propose(target_token_ids, position_ids, target_hidden_states, last_token_indices,
+                                        attn_metadata, prefill_batch_block_table, self)
         # Follow GPU to shift input_tokens by one to the left
         # to match hidden_states
-        token_ids = token_ids.squeeze()
+        token_ids = token_ids.reshape(-1)
         target_token_ids = token_ids.clone()
         target_token_ids[:-1].copy_(token_ids[1:])
         target_token_ids[logits_indices] = next_token_ids
