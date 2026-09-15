@@ -1,0 +1,5 @@
+libclamp_swiglu_kernels.so
+build_ext/
+*.o
+kernel_binary.h
+.graph_dumps/
