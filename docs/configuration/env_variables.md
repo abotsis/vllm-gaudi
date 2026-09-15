@@ -81,7 +81,7 @@ HPU PyTorch bridge environment variables impacting vLLM execution:
 | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
 | `PT_HPU_LAZY_MODE`                 | Sets the backend for Gaudi, with `0` for PyTorch Eager and `1` for PyTorch Lazy.                                                                      | `0`                                              |
 | `PT_HPU_ENABLE_LAZY_COLLECTIVES`   | Must be set to `true` for tensor parallel inference with HPU Graphs.                                                                                  | `true`                                           |
-| `PT_HPUGRAPH_DISABLE_TENSOR_CACHE` | Must be set to `false` for LLaVA, Qwen, and RoBERTa models.                                                                                           | `false`                                          |
+| `PT_HPUGRAPH_DISABLE_TENSOR_CACHE` | Must be set to `false` for LLaVA, Qwen, and RoBERTa models. Managed by the runner for `glm5_next` when `VLLM_HPU_DECODE_TENSOR_CACHE` is active (see below). | `false`     |
 | `VLLM_PROMPT_USE_FLEX_ATTENTION`   | Enabled only for the Llama model, allowing usage of `torch.nn.attention.flex_attention` instead of FusedSDPA. Requires `VLLM_PROMPT_USE_FUSEDSDPA=0`. | `false`                                          |
 | `RUNTIME_SCALE_PATCHING`           | Enables the runtime scale patching feature, which applies only to FP8 execution and is ignored for BF16.                                              | `true` (Torch Compile mode), `false` (Lazy mode) |
 | `ENABLE_EXPERIMENTAL_FLAGS` and `ENABLE_SKIP_REMOVAL_OF_GRAPH_INPUT_IDENTITY_NODES` | Must both be set to `true` for Qwen3.5 (GDN hybrid) models to improve graph compilation performance. | `false`                                          |
@@ -188,3 +188,28 @@ full K/V and the results simply concatenate; the output is unchanged apart from 
 !!! note
     This is independent of `VLLM_HPU_FSDPA_SLICE_ENABLED` and works with any bucketing strategy.
     When enabled, shapes whose bias already fits below the limit take the untiled path unchanged.
+
+## GLM-5.3-Flash (glm5_next)
+
+Environment variables of the GLM-5.3-Flash (glm5_next) HPU support. See
+[GLM-5.3-Flash](../features/glm53_flash.md) for the feature description.
+
+| Parameter name                    | Description                                                                | Default value |
+| --------------------------------- | -------------------------------------------------------------------------- | ------------- |
+| `VLLM_GLM_KDA_EAGER`              | Force the (slower) reference eager chunk kernel for KDA layers instead of the fast chunk kernel. A correctness fallback. | `0`           |
+| `VLLM_GLM_MTP_DRAFT_GRAPH`        | Run the MTP draft head as its own HPU graph. `0` falls back to eager drafting for the draft head. | `1`           |
+| `VLLM_GLM_MTP_DRAFT_ATTN`         | Debug/A-B lever for the draft attention path: `1` restores the pre-fix draft attention read pattern (padding slots read the target cache). | `0`           |
+| `VLLM_GLM_MTP_ATTN_SCALE_FILE`    | Experimental: file-backed attention-scale overrides for the draft head (A/B harness only; leave unset). | unset         |
+| `VLLM_GLM_TPC_CLAMP`              | Use the TPC `clamp_swiglu_fwd_bf16` kernel for the clamped-SwiGLU activation on device. `auto` enables it when the kernel is built; `0` forces the torch reference. | `auto`        |
+| `VLLM_GLM_TPC_CLAMP_LOADER`       | Path of the `tpc_clamp_swiglu/loader.py` loader module. Default: the packaged loader. | packaged      |
+| `VLLM_GLM_MOE_MIN_FREE_GB`        | Minimum free HBM (GB) required before the MoE expert cache allocates device rows; skips the cache under memory pressure instead of OOMing. | `4`           |
+| `VLLM_KDA_NEUMANN_ITERS`          | Neumann-series iteration cap for the KDA kernel numerics. Leave at the default (16) unless debugging with Habana kernels guidance. | `2`           |
+| `VLLM_GLM_MOE_CACHE_EXPERTS`      | Number of hot experts per layer kept resident on device for the decode path expert cache. Memory-guarded against free HBM; `0` disables the cache. | `10`          |
+| `VLLM_GLM_GRAPH_CACHE`            | Engage the graph-safe static expert-cache path for MoE layers during HPU-graph replay. `auto` follows the runner's per-step graph intent. | `auto`        |
+| `VLLM_HPU_DECODE_TENSOR_CACHE`    | Keep the HPU-graph tensor cache for decode graphs (prefill graphs keep the default policy of re-allocating intermediates per replay). Decode graphs' intermediates are small, and skipping the per-recipe re-allocation removes host work from every replayed recipe. Default on for `glm5_next` without speculative decoding; the tensors cost host memory (about 7 GB RSS per worker at the end of decode warmup for GLM-5.3), which with speculative decoding's doubled graph count exceeds a 125 GB host at TP=8, so it defaults off there. `0`/`1` overrides. | on for `glm5_next` (no spec decode), off otherwise |
+| `VLLM_HPU_GRAPH_ASYNC_REPLAY`     | Replay captured HPU graphs asynchronously (the bridge queues the recipes from its own thread and returns to Python before execution completes). Bit-identical output; kept as an opt-in for re-measurement only. | `0`      |
+
+!!! note
+    `VLLM_HPU_DECODE_TENSOR_CACHE` and `VLLM_HPU_GRAPH_ASYNC_REPLAY` are
+    GLM-5.3 development features; they apply to any model, but their defaults
+    and validation currently target the GLM-5.3-Flash recipe.

@@ -44,12 +44,23 @@ if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
 
 
-def setup_step_profiler(steps):
+def setup_step_profiler(steps, rank=0):
+    """torch.profiler over engine steps [start, end] (VLLM_PROFILE_STEPS=start,end).
+
+    VLLM_PROFILER_RANK0_ONLY=1 (default) arms it on rank 0 only: eight TP
+    workers each holding a profiler with Python stacks pushed a 125 GB host
+    over its limit (OOM killed a worker, then the user session) at the first
+    profiled step on GLM-5.3. VLLM_PROFILER_WITH_STACK=0 (default) drops the
+    stack capture for the same reason; set 1 for Python-attributed traces.
+    """
     if steps is None:
+        return None
+    if os.environ.get("VLLM_PROFILER_RANK0_ONLY", "1") == "1" and rank != 0:
         return None
     step_start, step_end = steps
     active = step_end - step_start + 1
-    return setup_profiler(warmup=0, active=active)
+    with_stack = os.environ.get("VLLM_PROFILER_WITH_STACK", "0") == "1"
+    return setup_profiler(warmup=0, active=active, with_stack=with_stack)
 
 
 class HPUWorker(WorkerBase):
@@ -80,7 +91,15 @@ class HPUWorker(WorkerBase):
         self.gc_track_recompiles = get_config().track_graph_compilation and not get_config().high_level_profiler_enabled
         self.step = 0
         self.profile_steps = get_config().VLLM_PROFILE_STEPS
-        self.step_profiler = setup_step_profiler(self.profile_steps)
+        self.step_profiler = setup_step_profiler(self.profile_steps, rank)
+        # VLLM_PROFILE_MIN_TOKENS=N: only steps scheduling at least N tokens
+        # count toward the VLLM_PROFILE_STEPS window (self.profile_step), so a
+        # long-prompt profile is not consumed by readiness/calibration
+        # requests that precede it (a 3100-token probe once profiled its own
+        # 203-token calibration prefill and stopped the engine before the
+        # target request ran).
+        self.profile_min_tokens = int(os.environ.get("VLLM_PROFILE_MIN_TOKENS", "0"))
+        self.profile_step = 0
         self.step_debug = init_debug_logger('steps')
 
         self.model_sleeping = False
@@ -563,7 +582,12 @@ class HPUWorker(WorkerBase):
         )
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        if not self.step_debug:
+            return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        t0 = time.perf_counter()
+        out = self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        self.step_debug(f'step={self.step - 1} sample_tokens_ms={(time.perf_counter() - t0) * 1000:.1f}')
+        return out
 
     @torch.inference_mode()
     def execute_model(
@@ -572,20 +596,32 @@ class HPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | None:
         if self.step_debug:
             self.step_debug(f'step={self.step}')
-        if self.step_profiler and self.step == self.profile_steps[0]:
+        counts_for_profile = (self.step_profiler is not None and getattr(
+            scheduler_output, "total_num_scheduled_tokens", self.profile_min_tokens) >= self.profile_min_tokens)
+        if counts_for_profile and self.profile_step == self.profile_steps[0]:
+            logger.info("step profiler start: engine step %d, profile step %d, %s scheduled tokens", self.step,
+                        self.profile_step, getattr(scheduler_output, "total_num_scheduled_tokens", "?"))
             self.step_profiler.start()
+        t_exec = time.perf_counter()
         with track_graph_compile('HPUWorker.execute_model') \
                 if self.gc_track_recompiles \
                 else contextlib.nullcontext():
             output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
+        if self.step_debug:
+            # VLLM_DEBUG=steps: host wall of execute_model per engine step with
+            # the scheduled token count (prefill TTFT attribution without a
+            # profiler; sample_tokens is timed separately below).
+            self.step_debug(f'step={self.step} tokens={getattr(scheduler_output, "total_num_scheduled_tokens", "?")} '
+                            f'execute_model_ms={(time.perf_counter() - t_exec) * 1000:.1f}')
         # TODO(woosuk): Send the output to the engine process.
-        if self.step_profiler:
-            if self.step >= self.profile_steps[0]:
+        if counts_for_profile:
+            if self.profile_step >= self.profile_steps[0]:
                 self.step_profiler.step()
-            if self.step == self.profile_steps[1]:
+            if self.profile_step == self.profile_steps[1]:
                 self.step_profiler.stop()
                 self.step_profiler = None
                 raise RuntimeError('Step profiling finished!')
+            self.profile_step += 1
         self.step += 1
         # NOTE(Harish): removed "if self.rank == 0 else None" for KV_connector enabling with TP>1
         # referred to Gpu Model Runner, KV connector aggregation expects valid output from all ranks

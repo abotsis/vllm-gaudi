@@ -1385,6 +1385,37 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w13_weight_scale = self._cached_w13_scale_views
         w2_weight_scale = self._cached_w2_scale_views
 
+        if self.swiglu_limit is not None:
+            # Clamped SwiGLU (GLM-5.x): the native GPT-SwiGLU lowering, which
+            # keeps weights fp8 and fuses routing+GEMMs+activation in one
+            # Synapse kernel -- the path the string-activation overload cannot
+            # express because its enum has no clamped SiLU.
+            x_fp8, x_scale = dynamic_quant(x)
+            # chunk_size: VLLM_MOE_CHUNK/VLLM_MOE_TOKEN_BOUNDARY as for the plain
+            # overload (0 = kernel default); _diag_chunk_size overrides for benches.
+            clamp_kwargs = self._get_extra_kwargs(tokens_num)
+            chunk_size = getattr(self, "_diag_chunk_size", clamp_kwargs.get("chunk_size", 0))
+            return torch.ops.hpu.mixture_of_experts.bias_fp8_fused_weights(
+                x_fp8,
+                topk_ids.to(torch.int64),
+                topk_weights.to(x.dtype),
+                w13_list,
+                w2_list,
+                self._clamp_bias12,
+                self._clamp_bias3,
+                x_scale,
+                self._clamp_d_inter,
+                w13_weight_scale,
+                w2_weight_scale,
+                permuted_weights=permuted_weights,
+                experts_min=self.experts_min,
+                experts_max=self.experts_max,
+                chunk_size=chunk_size,
+                total_experts=self.global_num_experts if chunk_size else 0,
+                alpha=self.swiglu_alpha,
+                limit=self.swiglu_limit,
+            )
+
         if self.w13_input_scale is None:
             x_fp8, x_scale = dynamic_quant(x)
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,

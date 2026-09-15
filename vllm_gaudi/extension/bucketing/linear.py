@@ -155,6 +155,12 @@ def warmup_range(config: Tuple[int, int, int]):
     stable = range(bstep, bmax + 1, bstep)
     buckets = list(ramp_up_tw) + list(stable)
     buckets = [b for b in buckets if b >= bmin]
+    # The configured max is a bucket even when it is not on the step grid
+    # (128/2048/3200 -> 128..2048 plus 3200). The runtime would otherwise add
+    # it on demand ("... was not prepared. Adding new bucket") and compile it
+    # on the first request that needs it.
+    if buckets and buckets[-1] < bmax:
+        buckets.append(bmax)
     if add_zero_bucket:
         buckets.append(0)
     return list(buckets)

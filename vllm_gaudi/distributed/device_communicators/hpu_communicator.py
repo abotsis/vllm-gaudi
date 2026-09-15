@@ -9,9 +9,64 @@ from vllm.distributed.device_communicators.base_device_communicator \
     import DeviceCommunicatorBase
 from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group, get_tp_group, get_ep_group
 
+import os
+
 import habana_frameworks.torch as htorch  # noqa: F401
 
 from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata
+
+# See all_reduce(). Default OFF: the mark_step it guards was a stale bridge
+# workaround that cost a graph boundary per collective.
+_ALLREDUCE_MARKSTEP = os.environ.get("VLLM_HPU_ALLREDUCE_MARKSTEP", "0") == "1"
+
+# VLLM_HPU_ALLREDUCE_MODE selects how the TP/EP all-reduce sums partials:
+#   gather_sum (default) all_gather the partials and sum them on every rank in
+#              rank order in fp32. The result is independent of which rank
+#              owned which chunk of the buffer. HCCL's all-reduce sums each
+#              chunk in a chunk-dependent rank order; at [bs, hidden] a chunk
+#              is one decode row, so with it a row's residual after o_proj /
+#              MoE down-proj depended on its position in the batch by ~1 bf16
+#              ULP. On GLM-5.3 (recurrent state + MoE routing at near-ties)
+#              that turned into different greedy tokens for co-batched
+#              requests: 8 identical prompts at once gave 7 texts; with
+#              gather_sum 1 text, and serial vs concurrent 12/12 identical
+#              under pinned buckets. Measured decode cost: none (14.7 vs 13.6
+#              tok/s single-stream, restart noise). Bounded by
+#              VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES; larger buffers use hccl.
+#   fp32       upcast, dist.all_reduce, downcast: fewer order-dependent roundings.
+#   hccl       dist.all_reduce in the tensor's dtype (previous behaviour).
+#   transpose  all-reduce a hidden-major copy ([hidden, tokens] contiguous) and
+#              transpose back. If HCCL splits the flat buffer into a fixed
+#              number of contiguous chunks, an element's chunk then depends on
+#              its hidden index only, not on the token's row position or the
+#              token count, at 2x working memory instead of gather_sum's
+#              world_size x. Candidate for co-batched prefill; unproven.
+_ALLREDUCE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_MODE", "gather_sum").strip().lower()
+if _ALLREDUCE_MODE not in ("hccl", "fp32", "gather_sum", "transpose"):
+    raise ValueError(f"VLLM_HPU_ALLREDUCE_MODE must be hccl, fp32, gather_sum or transpose, got {_ALLREDUCE_MODE!r}")
+# Buffers above the cap (co-batched prefill) use VLLM_HPU_ALLREDUCE_LARGE_MODE
+# in {hccl, fp32, transpose}; default hccl (previous behaviour).
+_ALLREDUCE_LARGE_MODE = os.environ.get("VLLM_HPU_ALLREDUCE_LARGE_MODE", "hccl").strip().lower()
+if _ALLREDUCE_LARGE_MODE not in ("hccl", "fp32", "transpose"):
+    raise ValueError(f"VLLM_HPU_ALLREDUCE_LARGE_MODE must be hccl, fp32 or transpose, got {_ALLREDUCE_LARGE_MODE!r}")
+# Inputs whose gathered/upcast working buffer would exceed this fall back to the
+# plain HCCL all-reduce. Every all-reduce site inside a captured graph retains
+# its working buffers, and a 3200-token prefill has ~88 sites: gather_sum at
+# that size (8 x 26 MiB per site) failed device allocation during warmup.
+# Decode buffers ([bs, hidden]) are far below the default.
+_ALLREDUCE_ALT_MAX_BYTES = int(os.environ.get("VLLM_HPU_ALLREDUCE_ALT_MAX_BYTES", str(16 * 1024 * 1024)))
+
+
+def sum_in_rank_order(gathered: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Sum [world, ...] partials in index order with fp32 accumulation, then cast.
+
+    Pure function of the gathered tensor: every rank computes the same bits,
+    and a row's result does not depend on its position in the buffer.
+    """
+    acc = gathered[0].float().clone()
+    for rank in range(1, gathered.shape[0]):
+        acc += gathered[rank].float()
+    return acc.to(dtype)
 
 
 class HpuCommunicator(DeviceCommunicatorBase):
@@ -42,10 +97,38 @@ class HpuCommunicator(DeviceCommunicatorBase):
         self.rank = dist.get_rank(group=self.cpu_group)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
-        # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
-        # (which is required for tensor parallel HPUGraph inference)
-        htorch.core.mark_step()
+        # No mark_step here. The one that used to precede this call was a
+        # workaround for an older-bridge bug under PT_HPU_ENABLE_LAZY_COLLECTIVES.
+        # It is a hard graph cut, and a decode step issues ~90 all-reduces (2
+        # per layer), so it cut the step into ~230 recipes with a boundary
+        # after each collective that cost a mid-teens percent of the
+        # single-stream decode step, before counting the recipe merges it
+        # prevented. Re-tested on bridge 1.24 with a 2-rank chained-graph
+        # bench: no mark_step is bit-identical to the workaround and 10%
+        # faster between graphs, 32% faster with the collective fused inside
+        # the graph. VLLM_HPU_ALLREDUCE_MARKSTEP=1 restores the old behaviour.
+        if _ALLREDUCE_MARKSTEP:
+            htorch.core.mark_step()
+        working_bytes = input_.numel() * input_.element_size() * (self.world_size
+                                                                  if _ALLREDUCE_MODE == "gather_sum" else 2)
+        mode = _ALLREDUCE_MODE if working_bytes <= _ALLREDUCE_ALT_MAX_BYTES else _ALLREDUCE_LARGE_MODE
+        if mode == "gather_sum":
+            flat = input_.contiguous()
+            gathered = torch.empty((self.world_size, ) + tuple(flat.shape), dtype=flat.dtype, device=flat.device)
+            dist.all_gather_into_tensor(gathered, flat, group=self.device_group)
+            input_.copy_(sum_in_rank_order(gathered, input_.dtype))
+            return input_
+        if mode == "fp32":
+            upcast = input_.float()
+            dist.all_reduce(upcast, group=self.device_group)
+            input_.copy_(upcast.to(input_.dtype))
+            return input_
+        if mode == "transpose" and input_.dim() >= 2:
+            rows = input_.reshape(-1, input_.shape[-1])
+            hidden_major = rows.transpose(0, 1).contiguous()
+            dist.all_reduce(hidden_major, group=self.device_group)
+            input_.copy_(hidden_major.transpose(0, 1).reshape(input_.shape))
+            return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
