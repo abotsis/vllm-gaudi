@@ -969,3 +969,26 @@ Depth 4 stays. Depth 5 gains 0.1 accepted token but the 48-lane verify
 step costs more than it returns; depth 3 saves nothing single-stream and
 loses aggregate. Greedy 5/8 for 3 and 5 vs the depth-4 reference is the
 verify-shape near-tie effect, not an error.
+
+## 27. 262144-token context trial (2026-09-15 08:53-09:30)
+
+`MAXLEN=262144 GMU=0.25 NSPEC=4 MAXSEQ=8` with an explicit bucket file
+(`run/buckets_256k.txt`: prompt ctx 0/64/128/192/256/512/1024/1536/2048
+blocks x 6 query buckets; decode blocks 128..10240). Boot: KV 507k tokens
+(1.93 x 262k), 54 prompt graphs 13.0 GiB, 23 decode graphs 6.2 GiB,
+warmup 388 s, no un-warmed shapes.
+
+| prompt tokens | TTFT | prompt tok/s | decode at that context |
+|---|---|---|---|
+| 28,018 | 12.0 s | 2345 | - |
+| 87,523 | 47.3 s | 1849 | 5.7 tok/s |
+| 218,773 | 140.8 s | 1554 | 6.0 tok/s |
+| short prompt | 0.4 s | - | 23.5 tok/s |
+
+Context is per sequence; the pool holds ~507k tokens across requests.
+Prefill beyond 16k of context runs eager (~1.5-2k tok/s); decode at
+long context drops to ~6 tok/s: each of the 5 speculative lanes carries
+the request's whole block table, so a 219k context is 10240 blocks per
+step of paged attention. Levers, both substantial: share the block table
+across a request's lanes instead of replicating it, and the paged
+attention kernel's throughput at thousands of blocks.
